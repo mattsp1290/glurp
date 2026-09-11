@@ -43,49 +43,7 @@ func (c Coordinator) Run(ctx context.Context, s Selection) Report {
 		defer wg.Done()
 		for host := range hostCh {
 			for _, id := range s.Harnesses {
-				if ctx.Err() != nil {
-					itemCh <- Item{Host: host.Name, Harness: string(id), Status: "failed", Detail: "cancelled", Version: "unknown"}
-					continue
-				}
-				taskctx := ctx
-				cancel := func() {}
-				if s.Timeout > 0 {
-					taskctx, cancel = context.WithTimeout(ctx, s.Timeout)
-				}
-				batch, err := c.Archive.BeginHostHarness(host.Name, host.Destination, string(id))
-				if err != nil {
-					cancel()
-					itemCh <- failedItem(host, id, err)
-					continue
-				}
-				res, err := harness.Collect(taskctx, c.Runner, host, id, batch, s.Limits)
-				cancel()
-				if err != nil {
-					batch.Abort()
-					itemCh <- failedItem(host, id, err)
-					continue
-				}
-				if res.Status == "failed" {
-					batch.Abort()
-					itemCh <- Item{Host: host.Name, Harness: string(id), Status: "failed", Detail: res.Detail, Version: version(res.Version), Files: res.Files, Bytes: res.Bytes}
-					continue
-				}
-				if res.Status == "not-found" {
-					batch.Abort()
-					itemCh <- Item{Host: host.Name, Harness: string(id), Status: "not-found", Detail: res.Detail, Version: version(res.Version)}
-					continue
-				}
-				batch.SetCollectorVersion(version(res.Version))
-				written, unchanged, err := batch.Commit(c.Now())
-				if err != nil {
-					itemCh <- failedItem(host, id, err)
-					continue
-				}
-				status := "collected"
-				if written == 0 && res.Files > 0 {
-					status = "unchanged"
-				}
-				itemCh <- Item{Host: host.Name, Harness: string(id), Status: status, Version: version(res.Version), Files: res.Files, Written: written, Unchanged: unchanged, Bytes: res.Bytes}
+				itemCh <- c.runOne(ctx, s, host, id)
 			}
 		}
 	}
@@ -115,12 +73,46 @@ func (c Coordinator) Run(ctx context.Context, s Selection) Report {
 	})
 	return r
 }
+
+func (c Coordinator) runOne(ctx context.Context, s Selection, host config.Host, id harness.ID) Item {
+	if ctx.Err() != nil {
+		return Item{Host: host.Name, Harness: string(id), Status: "failed", Detail: "cancelled", Version: "unknown"}
+	}
+	taskctx := ctx
+	cancel := func() {}
+	if s.Timeout > 0 {
+		taskctx, cancel = context.WithTimeout(ctx, s.Timeout)
+	}
+	defer cancel()
+	batch, err := c.Archive.BeginHostHarness(host.Name, host.Destination, string(id))
+	if err != nil {
+		return failedItem(host, id, err)
+	}
+	defer batch.Abort()
+	res, err := harness.Collect(taskctx, c.Runner, host, id, batch, s.Limits)
+	if err != nil {
+		return failedItem(host, id, err)
+	}
+	if res.Status == "failed" {
+		return Item{Host: host.Name, Harness: string(id), Status: "failed", Detail: res.Detail, Version: version(res.Version), Files: res.Files, Bytes: res.Bytes}
+	}
+	if res.Status == "not-found" {
+		return Item{Host: host.Name, Harness: string(id), Status: "not-found", Detail: res.Detail, Version: version(res.Version)}
+	}
+	batch.SetCollectorVersion(version(res.Version))
+	written, unchanged, err := batch.Commit(c.Now())
+	if err != nil {
+		return failedItem(host, id, err)
+	}
+	status := "collected"
+	if written == 0 && res.Files > 0 {
+		status = "unchanged"
+	}
+	return Item{Host: host.Name, Harness: string(id), Status: status, Version: version(res.Version), Files: res.Files, Written: written, Unchanged: unchanged, Bytes: res.Bytes}
+}
 func failedItem(h config.Host, id harness.ID, err error) Item {
 	return Item{Host: h.Name, Harness: string(id), Status: "failed", Detail: fmt.Sprintf("%v", err), Version: "unknown"}
 }
 func version(v string) string {
-	if v == "" {
-		return "unknown"
-	}
-	return v
+	return normalizeVersion(v)
 }

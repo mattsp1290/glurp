@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +35,12 @@ func TestDecodeRejectsUnsafeAndTruncated(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected rejection")
 		}
+	}
+}
+func TestDecodeMetadataBudget(t *testing.T) {
+	_, err := Decode(bytes.NewReader(stream("long-path.jsonl", "", "ok")), Limits{MaxFileBytes: 1, MaxFiles: 2, MaxTotalBytes: 2, MaxMetadataBytes: 16}, func(a Artifact) error { _, e := io.Copy(io.Discard, a.Body); return e })
+	if err == nil || !strings.Contains(err.Error(), "metadata limit") {
+		t.Fatalf("expected metadata limit error, got %v", err)
 	}
 }
 func FuzzDecode(f *testing.F) {

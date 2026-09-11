@@ -14,12 +14,16 @@ import (
 	sshtransport "github.com/mattsp1290/slurp/internal/ssh"
 )
 
-type shellRunner struct{ home string }
+type shellRunner struct{ home, tmpdir string }
 
 func (r shellRunner) Run(ctx context.Context, _ string, script string, consume func(io.Reader) error) (sshtransport.Result, error) {
 	cmd := exec.CommandContext(ctx, "/bin/sh")
 	cmd.Dir = r.home
-	cmd.Env = []string{"HOME=" + r.home, "PATH=" + os.Getenv("PATH"), "TMPDIR=" + os.TempDir()}
+	tmpdir := r.tmpdir
+	if tmpdir == "" {
+		tmpdir = os.TempDir()
+	}
+	cmd.Env = []string{"HOME=" + r.home, "PATH=" + os.Getenv("PATH"), "TMPDIR=" + tmpdir}
 	cmd.Stdin = io.NopCloser(stringsReader(script))
 	out, e := cmd.StdoutPipe()
 	if e != nil {
@@ -50,7 +54,7 @@ func TestExplicitRootIsLiteralAndRequired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := Collect(context.Background(), shellRunner{home}, host, Pi, b, Limits{MaxFileBytes: 1024, MaxFiles: 10, MaxTotalBytes: 4096})
+	res, err := Collect(context.Background(), shellRunner{home: home}, host, Pi, b, Limits{MaxFileBytes: 1024, MaxFiles: 10, MaxTotalBytes: 4096})
 	if err != nil {
 		b.Abort()
 		t.Fatal(err)
@@ -69,7 +73,7 @@ func TestExplicitRootIsLiteralAndRequired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err = Collect(context.Background(), shellRunner{home}, host, Pi, b, Limits{MaxFileBytes: 1024, MaxFiles: 10, MaxTotalBytes: 4096})
+	res, err = Collect(context.Background(), shellRunner{home: home}, host, Pi, b, Limits{MaxFileBytes: 1024, MaxFiles: 10, MaxTotalBytes: 4096})
 	if err != nil {
 		b.Abort()
 		t.Fatal(err)
@@ -77,6 +81,43 @@ func TestExplicitRootIsLiteralAndRequired(t *testing.T) {
 	b.Abort()
 	if res.Status != "failed" {
 		t.Fatalf("missing explicit root was %#v", res)
+	}
+}
+
+func TestCollectorHandlesHostileFilenamesWithoutScratchFiles(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "sessions")
+	names := []string{"line\nbreak.jsonl", "tab\tname.jsonl", "space name.jsonl", "back\\slash.jsonl", "-leading.jsonl"}
+	for _, name := range names {
+		write(t, filepath.Join(root, name), name)
+	}
+	tmpdir := filepath.Join(home, "attacker-tmp")
+	if err := os.Mkdir(tmpdir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	data := t.TempDir()
+	host := config.Host{Name: "fixture", Destination: "fixture", Sources: config.SourceOverrides{Pi: []string{root + string(os.PathSeparator)}}}
+	b, err := (archive.Store{Root: data}).BeginHostHarness("fixture", "fixture", "pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Collect(context.Background(), shellRunner{home: home, tmpdir: tmpdir}, host, Pi, b, Limits{MaxFileBytes: 1024, MaxFiles: 20, MaxTotalBytes: 4096})
+	if err != nil {
+		b.Abort()
+		t.Fatal(err)
+	}
+	if res.Status != "ok" || res.Files != uint64(len(names)) {
+		b.Abort()
+		t.Fatalf("result %#v", res)
+	}
+	if _, _, err = b.Commit(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		got, err := os.ReadFile(filepath.Join(data, "hosts", "fixture", "pi", "root-0001", name))
+		if err != nil || string(got) != name {
+			t.Errorf("artifact %q: %q %v", name, got, err)
+		}
 	}
 }
 
@@ -117,7 +158,7 @@ func TestNativeCollectorsUnderBinSh(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		res, e := Collect(context.Background(), shellRunner{home}, config.Host{Name: "fixture", Destination: "fixture"}, id, b, Limits{MaxFileBytes: 1024, MaxFiles: 20, MaxTotalBytes: 4096})
+		res, e := Collect(context.Background(), shellRunner{home: home}, config.Host{Name: "fixture", Destination: "fixture"}, id, b, Limits{MaxFileBytes: 1024, MaxFiles: 20, MaxTotalBytes: 4096})
 		if e != nil {
 			b.Abort()
 			t.Fatalf("%s: %v", id, e)

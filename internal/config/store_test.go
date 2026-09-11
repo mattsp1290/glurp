@@ -8,7 +8,11 @@ import (
 )
 
 func TestStoreCRUDAndPermissions(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "config", "config.json")
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(root, "config", "config.json")
 	s := Store{Path: p}
 	var wg sync.WaitGroup
 	for _, n := range []string{"b", "a"} {

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/mattsp1290/slurp/internal/safepath"
 	"golang.org/x/sys/unix"
 )
 
@@ -42,6 +43,9 @@ func (s Store) RemoveHost(name string) error {
 
 func ensureDir(path string) error {
 	path = filepath.Clean(path)
+	if err := safepath.CheckTrustedParents(path); err != nil {
+		return err
+	}
 	if err := rejectSymlinkComponents(path); err != nil {
 		return err
 	}
@@ -105,7 +109,7 @@ func openLock(path string) (*os.File, error) {
 }
 
 func (s Store) Load() (Config, error) {
-	if err := rejectSymlinkComponents(filepath.Dir(s.Path)); err != nil {
+	if err := safepath.CheckTrustedParents(s.Path); err != nil {
 		return Config{}, err
 	}
 	if err := rejectSymlinkComponents(filepath.Dir(s.Path)); err != nil {
@@ -229,9 +233,5 @@ func (s Store) mutate(fn func(*Config) error) error {
 	if err := os.Rename(tmpName, s.Path); err != nil {
 		return err
 	}
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
-	return nil
+	return safepath.SyncDir(dir)
 }

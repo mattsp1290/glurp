@@ -3,8 +3,11 @@ package collect
 import (
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 type Item struct {
@@ -12,6 +15,8 @@ type Item struct {
 	Files, Written, Unchanged, Bytes       uint64
 }
 type Report struct{ Items []Item }
+
+var safeVersion = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+ /@():-]{0,127}$`)
 
 func (r Report) Failed() bool {
 	for _, i := range r.Items {
@@ -35,7 +40,7 @@ func (r Report) Print(w io.Writer) {
 		if i.Detail != "" {
 			detail = " (" + sanitize(i.Detail) + ")"
 		}
-		fmt.Fprintf(w, "%s/%s: %s; files=%d written=%d unchanged=%d bytes=%d version=%s%s\n", i.Host, i.Harness, i.Status, i.Files, i.Written, i.Unchanged, i.Bytes, i.Version, detail)
+		fmt.Fprintf(w, "%s/%s: %s; files=%d written=%d unchanged=%d bytes=%d version=%s%s\n", i.Host, i.Harness, i.Status, i.Files, i.Written, i.Unchanged, i.Bytes, normalizeVersion(i.Version), detail)
 		files += i.Files
 		written += i.Written
 		unchanged += i.Unchanged
@@ -51,13 +56,25 @@ func (r Report) Print(w io.Writer) {
 }
 func sanitize(s string) string {
 	s = strings.Map(func(r rune) rune {
-		if r < ' ' || r == 127 {
+		if unicode.IsControl(r) || r >= 0x202a && r <= 0x202e || r >= 0x2066 && r <= 0x2069 {
 			return -1
 		}
 		return r
 	}, s)
 	if len(s) > 240 {
-		return s[:240]
+		end := 240
+		for end > 0 && !utf8.RuneStart(s[end]) {
+			end--
+		}
+		return s[:end]
 	}
 	return s
+}
+
+func normalizeVersion(v string) string {
+	v = strings.TrimSpace(v)
+	if !safeVersion.MatchString(v) {
+		return "unknown"
+	}
+	return v
 }

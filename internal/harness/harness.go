@@ -81,7 +81,7 @@ func Collect(ctx context.Context, r Runner, host config.Host, id ID, b *archive.
 	var pr protocol.Result
 	_, err := r.Run(ctx, host.Destination, script, func(rd io.Reader) error {
 		var e error
-		pr, e = protocol.Decode(rd, protocol.Limits(limits), func(a protocol.Artifact) error {
+		pr, e = protocol.Decode(rd, protocol.Limits{MaxFileBytes: limits.MaxFileBytes, MaxFiles: limits.MaxFiles, MaxTotalBytes: limits.MaxTotalBytes}, func(a protocol.Artifact) error {
 			u, e := b.Put(a.Path, a.Size, a.Body)
 			if u {
 				pr.Unchanged++

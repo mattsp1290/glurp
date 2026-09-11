@@ -29,6 +29,9 @@ func newSlurpCommand(d Dependencies, o *options) *cobra.Command {
 		if maxFiles == 0 {
 			return fmt.Errorf("--max-files must be greater than zero")
 		}
+		if maxFiles > 1000000 {
+			return fmt.Errorf("--max-files must not exceed 1000000")
+		}
 		ids, e := harness.Parse(hs)
 		if e != nil {
 			return e

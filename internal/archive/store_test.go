@@ -59,3 +59,81 @@ func TestTraversalAndAbort(t *testing.T) {
 		t.Fatal("partial final artifact exists")
 	}
 }
+
+func TestExplicitRootBindingsAreAppendOnly(t *testing.T) {
+	s := Store{Root: t.TempDir()}
+	b, err := s.BeginHostHarness("host", "dest", "pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = b.BindRoots([]string{"/one", "/two"}); err != nil {
+		t.Fatal(err)
+	}
+	b.SetCollectorVersion("test")
+	if _, _, err = b.Commit(time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	for name, roots := range map[string][]string{"automatic": nil, "removed": {"/one"}, "reordered": {"/two", "/one"}} {
+		b, err = s.BeginHostHarness("host", "dest", "pi")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = b.BindRoots(roots); err == nil {
+			b.Abort()
+			t.Errorf("accepted %s transition", name)
+		} else {
+			b.Abort()
+		}
+	}
+	b, err = s.BeginHostHarness("host", "dest", "pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = b.BindRoots([]string{"/one", "/two", "/three"}); err != nil {
+		t.Fatalf("append rejected: %v", err)
+	}
+	b.Abort()
+}
+
+func TestBeginRecoversInterruptedPublication(t *testing.T) {
+	root := t.TempDir()
+	s := Store{Root: root}
+	b, err := s.BeginHostHarness("host", "dest", "pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = b.Put("session.jsonl", 3, strings.NewReader("old")); err != nil {
+		t.Fatal(err)
+	}
+	b.SetCollectorVersion("test")
+	if _, _, err = b.Commit(time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	final := filepath.Join(root, "hosts", "host", "pi", "session.jsonl")
+	stage := filepath.Join(root, ".tmp", "host", "pi", "run-crash")
+	if err = os.Mkdir(stage, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(final, filepath.Join(stage, "backup-000000")); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(final, []byte("new"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tx := transaction{Version: 1, ID: "run-crash", Stage: "run-crash", Entries: []transactionEntry{{Path: "session.jsonl", HadFinal: true}}}
+	if err = atomicJSON(filepath.Join(root, "state", "host", "pi.txn.json"), tx); err != nil {
+		t.Fatal(err)
+	}
+	b, err = s.BeginHostHarness("host", "dest", "pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Abort()
+	got, err := os.ReadFile(final)
+	if err != nil || string(got) != "old" {
+		t.Fatalf("recovery got %q: %v", got, err)
+	}
+	if _, err = os.Stat(filepath.Join(root, "state", "host", "pi.txn.json")); !os.IsNotExist(err) {
+		t.Fatal("transaction journal remains")
+	}
+}

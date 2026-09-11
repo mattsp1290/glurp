@@ -12,11 +12,11 @@ import (
 
 const Magic = "SLURP\x00\x01\x00"
 
-type Limits struct{ MaxFileBytes, MaxFiles, MaxTotalBytes uint64 }
+type Limits struct{ MaxFileBytes, MaxFiles, MaxTotalBytes, MaxMetadataBytes uint64 }
 type Artifact struct {
-	Path, Checksum string
-	Size           uint64
-	Body           io.Reader
+	Path, SourceMutationToken string
+	Size                      uint64
+	Body                      io.Reader
 }
 type Result struct {
 	Status, Detail, Version string
@@ -48,6 +48,11 @@ func Decode(src io.Reader, limits Limits, put func(Artifact) error) (Result, err
 	}
 	seen := map[string]bool{}
 	var out Result
+	metadataLimit := limits.MaxMetadataBytes
+	if metadataLimit == 0 {
+		metadataLimit = 64 << 20
+	}
+	var metadataBytes uint64
 	for {
 		tag, err := r.ReadByte()
 		if err != nil {
@@ -84,6 +89,11 @@ func Decode(src io.Reader, limits Limits, put func(Artifact) error) (Result, err
 			if seen[p] {
 				return Result{}, fmt.Errorf("duplicate artifact path %q", p)
 			}
+			retained := uint64(len(p))*2 + uint64(len(ck)) + 512
+			if ^uint64(0)-metadataBytes < retained || metadataBytes+retained > metadataLimit {
+				return Result{}, fmt.Errorf("protocol metadata limit exceeded")
+			}
+			metadataBytes += retained
 			seen[p] = true
 			if limits.MaxFiles > 0 && out.Files >= limits.MaxFiles {
 				return Result{}, fmt.Errorf("artifact count limit exceeded")
@@ -98,7 +108,7 @@ func Decode(src io.Reader, limits Limits, put func(Artifact) error) (Result, err
 			if sz > uint64(^uint64(0)>>1) {
 				return Result{}, fmt.Errorf("artifact too large")
 			}
-			if err := put(Artifact{Path: p, Checksum: ck, Size: sz, Body: lr}); err != nil {
+			if err := put(Artifact{Path: p, SourceMutationToken: ck, Size: sz, Body: lr}); err != nil {
 				return Result{}, err
 			}
 			if lr.N != 0 {

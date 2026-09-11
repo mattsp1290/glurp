@@ -50,33 +50,32 @@ platform=$(uname -s 2>/dev/null || printf unknown)
 case "$platform" in Linux|Darwin) ;; *) printf 'T\000failed\000unsupported remote platform\000unknown\000E\000'; exit 0;; esac
 if command -v %s >/dev/null 2>&1; then installed=1; version=$(%s --version 2>/dev/null | sed -n '1p'); else installed=0; version=unknown; fi
 [ -n "$version" ] || version=unknown
-tmp=${TMPDIR:-/tmp}/slurp.$$
-trap 'rm -f "$tmp" "$tmp.sorted"' EXIT HUP INT TERM
 fail=0
 found=0
 collect_root() {
  root=$1
  prefix=$2
  case "$root" in '~/'*) root=$HOME/${root#\~/};; /*) ;; *) return 2;; esac
+ while [ "$root" != / ] && [ "${root%%/}" != "$root" ]; do root=${root%%/}; done
  if [ ! -d "$root" ] || [ ! -r "$root" ] || [ -L "$root" ]; then return 2; fi
  found=1
- if ! find "$root" -type f -print >"$tmp" 2>/dev/null; then return 3; fi
- LC_ALL=C sort "$tmp" >"$tmp.sorted" || return 3
- while IFS= read -r file; do
-   rel=${file#"$root"/}
-   case %s in
-    codex) case "$rel" in sessions/*.jsonl|sessions/*.jsonl.zst|archived_sessions/*.jsonl|archived_sessions/*.jsonl.zst|session_index.jsonl) ;; *) continue;; esac ;;
-    *) case "$rel" in %s) ;; *) continue;; esac ;;
-   esac
-   [ -f "$file" ] && [ ! -L "$file" ] || continue
-   before=$(cksum "$file" 2>/dev/null) || return 3
-   set -- $before; sum=$1; size=$2
-   printf 'F\000%%s\000%%s\000%%s\000' "$prefix$rel" "$size" "$sum"
-   cat "$file" || return 3
-   after=$(cksum "$file" 2>/dev/null) || return 3
-   [ "$before" = "$after" ] || return 3
- done <"$tmp.sorted"
- return 0
+ find "$root" -type f -exec sh -c '
+   root=$1; prefix=$2; kind=$3; pattern=$4; version=$5; shift 5
+   for file do
+     rel=${file#"$root"/}
+     case "$kind" in
+      codex) case "$rel" in sessions/*.jsonl|sessions/*.jsonl.zst|archived_sessions/*.jsonl|archived_sessions/*.jsonl.zst|session_index.jsonl) ;; *) continue;; esac ;;
+      *) case "$rel" in $pattern) ;; *) continue;; esac ;;
+     esac
+     if [ ! -f "$file" ] || [ -L "$file" ]; then printf "T\000failed\000source entry changed during collection\000%%s\000E\000" "$version"; exit 3; fi
+     before=$(cksum "$file" 2>/dev/null) || { printf "T\000failed\000source read failed\000%%s\000E\000" "$version"; exit 3; }
+     set -- $before; sum=$1; size=$2
+     printf "F\000%%s\000%%s\000%%s\000" "$prefix$rel" "$size" "$sum"
+     cat "$file" || { printf "T\000failed\000source read failed\000%%s\000E\000" "$version"; exit 3; }
+     after=$(cksum "$file" 2>/dev/null) || { printf "T\000failed\000source stability check failed\000%%s\000E\000" "$version"; exit 3; }
+     [ "$before" = "$after" ] || { printf "T\000failed\000source changed during collection\000%%s\000E\000" "$version"; exit 3; }
+   done
+ ' sh "$root" "$prefix" %s %s "$version" {} + || return 3
 }
 %s
 if [ "$fail" -ne 0 ]; then printf 'T\000failed\000source missing, unreadable, or changed during collection\000%%s\000E\000' "$version"; exit 0; fi
@@ -85,5 +84,5 @@ if [ "$found" -eq 0 ]; then
  exit 0
 fi
 printf 'T\000ok\000\000%%s\000E\000' "$version"
-	`, shellQuote(command), shellQuote(command), shellQuote(logical), match, calls.String(), len(roots))
+	`, shellQuote(command), shellQuote(command), shellQuote(logical), shellQuote(match), calls.String(), len(roots))
 }

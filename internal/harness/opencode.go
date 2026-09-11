@@ -22,13 +22,19 @@ func collectOpenCode(ctx context.Context, r Runner, host config.Host, b *archive
 	version := "unknown"
 	_, _ = r.Run(ctx, host.Destination, "#!/bin/sh\nexec opencode --version\n", func(rd io.Reader) error {
 		var buf bytes.Buffer
-		_, e := io.Copy(&buf, io.LimitReader(rd, 4097))
-		if e == nil && buf.Len() <= 4096 {
+		n, e := io.Copy(&buf, io.LimitReader(rd, 4097))
+		if e != nil {
+			return e
+		}
+		if n > 4096 {
+			return fmt.Errorf("OpenCode version output exceeds limit")
+		}
+		if buf.Len() <= 4096 {
 			if v := strings.TrimSpace(buf.String()); v != "" && !strings.ContainsAny(v, "\r\n") {
 				version = v
 			}
 		}
-		return e
+		return nil
 	})
 	script := `#!/bin/sh
 platform=$(uname -s 2>/dev/null || printf unknown)

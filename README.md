@@ -91,6 +91,8 @@ Each archive name is permanently bound to its stored destination string. Reusing
 
 Archive directories are owner-only and files are mode `0600`. Incoming paths are treated as hostile, symlinks are rejected in controlled paths, payloads are staged and synced before atomic publication, and remote stderr is discarded rather than echoed. The filesystem collectors do not follow remote symlinks.
 
+Config and archive overrides must have a trusted parent chain. Slurp rejects non-sticky directories writable by other accounts; a sticky shared parent such as `/tmp` is permitted, while Slurp-owned descendants are tightened to owner-only modes.
+
 These archives contain private prompts, model replies, tool results, file excerpts, and possibly credentials or other secrets. Filesystem permissions are not encryption; protect and back up the data directory accordingly.
 
 If an installed Claude Code, Codex, or pi executable is found but its automatic source cannot be resolved, Slurp reports a failure with explicit-path guidance. If OpenCode collection fails, verify its CLI version, noninteractive `PATH`, and database schema against [the tested compatibility matrix](docs/harness-compatibility.md). Windows clients and remotes are not supported.
