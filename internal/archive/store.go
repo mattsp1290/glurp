@@ -10,60 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/mattsp1290/slurp/internal/protocol"
 	"github.com/mattsp1290/slurp/internal/safepath"
 	"golang.org/x/sys/unix"
 )
-
-type Entry struct {
-	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
-	Bytes  uint64 `json:"bytes"`
-}
-type Manifest struct {
-	Version          int       `json:"version"`
-	Destination      string    `json:"destination"`
-	Harness          string    `json:"harness"`
-	CollectorVersion string    `json:"collector_version"`
-	CollectedAt      time.Time `json:"collected_at"`
-	Roots            []string  `json:"roots,omitempty"`
-	Entries          []Entry   `json:"entries"`
-	TransactionID    string    `json:"transaction_id,omitempty"`
-}
-type Identity struct {
-	Version     int    `json:"version"`
-	Destination string `json:"destination"`
-}
-type transaction struct {
-	Version int                `json:"version"`
-	ID      string             `json:"id"`
-	Stage   string             `json:"stage"`
-	Entries []transactionEntry `json:"entries"`
-}
-type transactionEntry struct {
-	Path     string `json:"path"`
-	HadFinal bool   `json:"had_final"`
-}
-type Store struct{ Root string }
-type staged struct {
-	entry       Entry
-	path, final string
-	unchanged   bool
-}
-type Batch struct {
-	store                      Store
-	host, harness, destination string
-	lock                       *os.File
-	stageDir                   string
-	files                      []staged
-	seen                       map[string]bool
-	roots                      []string
-	collectorVersion           string
-}
 
 func (b *Batch) SetCollectorVersion(v string) {
 	if v == "" {
@@ -72,184 +24,6 @@ func (b *Batch) SetCollectorVersion(v string) {
 	b.collectorVersion = v
 }
 
-func secureDir(path string) error {
-	if err := safepath.CheckTrustedParents(path); err != nil {
-		return err
-	}
-	if err := rejectSymlinkComponents(path); err != nil {
-		return err
-	}
-	st, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		missing := []string{}
-		cur := path
-		for {
-			if _, e := os.Lstat(cur); e == nil {
-				break
-			} else if !errors.Is(e, os.ErrNotExist) {
-				return e
-			}
-			missing = append(missing, cur)
-			next := filepath.Dir(cur)
-			if next == cur {
-				return fmt.Errorf("cannot find archive path ancestor")
-			}
-			cur = next
-		}
-		for i := len(missing) - 1; i >= 0; i-- {
-			if err := os.Mkdir(missing[i], 0700); err != nil && !errors.Is(err, os.ErrExist) {
-				return err
-			}
-			if err := os.Chmod(missing[i], 0700); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
-		return fmt.Errorf("unsafe archive directory %s", path)
-	}
-	if st.Mode().Perm() != 0700 {
-		return os.Chmod(path, 0700)
-	}
-	return nil
-}
-func secureUnder(root, target string) error {
-	rel, err := filepath.Rel(root, target)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return fmt.Errorf("archive path escapes root")
-	}
-	if err := secureDir(root); err != nil {
-		return err
-	}
-	cur := root
-	if rel == "." {
-		return nil
-	}
-	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
-		cur = filepath.Join(cur, part)
-		if err := secureDir(cur); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-func rejectSymlinkComponents(path string) error {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return err
-	}
-	cur := string(os.PathSeparator)
-	for _, part := range strings.Split(strings.TrimPrefix(abs, string(os.PathSeparator)), string(os.PathSeparator)) {
-		if part == "" {
-			continue
-		}
-		cur = filepath.Join(cur, part)
-		st, e := os.Lstat(cur)
-		if errors.Is(e, os.ErrNotExist) {
-			continue
-		}
-		if e != nil {
-			return e
-		}
-		if st.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("unsafe symlinked archive path component %s", cur)
-		}
-	}
-	return nil
-}
-func openLock(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW, 0600)
-	if err != nil {
-		return nil, err
-	}
-	f := os.NewFile(uintptr(fd), path)
-	if err := f.Chmod(0600); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return f, nil
-}
-func openRegularNoFollow(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, err
-	}
-	f := os.NewFile(uintptr(fd), path)
-	st, err := f.Stat()
-	if err != nil || !st.Mode().IsRegular() {
-		f.Close()
-		return nil, fmt.Errorf("archive target is not a regular file")
-	}
-	return f, nil
-}
-func atomicJSON(path string, value any) error {
-	if err := secureDir(filepath.Dir(path)); err != nil {
-		return err
-	}
-	if st, e := os.Lstat(path); e == nil && (st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular()) {
-		return fmt.Errorf("unsafe state target %s", path)
-	}
-	b, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	b = append(b, '\n')
-	f, err := os.CreateTemp(filepath.Dir(path), ".write-*.tmp")
-	if err != nil {
-		return err
-	}
-	n := f.Name()
-	defer os.Remove(n)
-	if err = f.Chmod(0600); err == nil {
-		_, err = f.Write(b)
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	if e := f.Close(); err == nil {
-		err = e
-	}
-	if err != nil {
-		return err
-	}
-	if err = os.Rename(n, path); err != nil {
-		return err
-	}
-	return safepath.SyncDir(filepath.Dir(path))
-}
-func (s Store) ensureIdentity(host, dest string) error {
-	p := filepath.Join(s.Root, "state", host, "identity.json")
-	if err := secureDir(filepath.Dir(p)); err != nil {
-		return err
-	}
-	if st, e := os.Lstat(p); e == nil && (st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular()) {
-		return fmt.Errorf("unsafe archive identity for host %q", host)
-	}
-	f, err := openRegularNoFollow(p)
-	if errors.Is(err, os.ErrNotExist) {
-		return atomicJSON(p, Identity{Version: 1, Destination: dest})
-	}
-	if err != nil {
-		return err
-	}
-	b, err := io.ReadAll(io.LimitReader(f, 1<<20))
-	_ = f.Close()
-	if err != nil {
-		return err
-	}
-	var id Identity
-	if json.Unmarshal(b, &id) != nil || id.Version != 1 {
-		return fmt.Errorf("invalid archive identity for host %q", host)
-	}
-	if id.Destination != dest {
-		return fmt.Errorf("archive host %q is bound to a different SSH destination; use a new host name", host)
-	}
-	return nil
-}
 func (s Store) BeginHostHarness(host, destination, harness string) (*Batch, error) {
 	if err := protocol.ValidateRelativePath(host); err != nil || strings.Contains(host, "/") {
 		return nil, fmt.Errorf("invalid archive host name")
@@ -264,7 +38,7 @@ func (s Store) BeginHostHarness(host, destination, harness string) (*Batch, erro
 	if err := secureUnder(s.Root, ld); err != nil {
 		return nil, err
 	}
-	il, err := openLock(filepath.Join(ld, "identity.lock"))
+	il, err := safepath.OpenLock(filepath.Join(ld, "identity.lock"))
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +52,7 @@ func (s Store) BeginHostHarness(host, destination, harness string) (*Batch, erro
 	if err != nil {
 		return nil, err
 	}
-	lf, err := openLock(filepath.Join(ld, harness+".lock"))
+	lf, err := safepath.OpenLock(filepath.Join(ld, harness+".lock"))
 	if err != nil {
 		return nil, err
 	}
@@ -311,101 +85,13 @@ func (s Store) BeginHostHarness(host, destination, harness string) (*Batch, erro
 	return &Batch{store: s, host: host, harness: harness, destination: destination, lock: lf, stageDir: run, seen: map[string]bool{}}, nil
 }
 
-func (s Store) recoverTransaction(host, harness string) error {
-	journalPath := filepath.Join(s.Root, "state", host, harness+".txn.json")
-	f, err := openRegularNoFollow(journalPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	data, err := io.ReadAll(io.LimitReader(f, 16<<20))
-	_ = f.Close()
-	if err != nil {
-		return err
-	}
-	var tx transaction
-	if err = json.Unmarshal(data, &tx); err != nil {
-		return fmt.Errorf("invalid archive transaction: %w", err)
-	}
-	if tx.Version != 1 || tx.ID != tx.Stage || !strings.HasPrefix(tx.Stage, "run-") || strings.ContainsAny(tx.Stage, "/\\") {
-		return fmt.Errorf("invalid archive transaction metadata")
-	}
-	manifestPath := filepath.Join(s.Root, "state", host, harness+".json")
-	committed := false
-	if mf, e := openRegularNoFollow(manifestPath); e == nil {
-		mb, _ := io.ReadAll(io.LimitReader(mf, 16<<20))
-		_ = mf.Close()
-		var m Manifest
-		if json.Unmarshal(mb, &m) == nil && m.TransactionID == tx.ID {
-			committed = true
-		}
-	}
-	stageDir := filepath.Join(s.Root, ".tmp", host, harness, tx.Stage)
-	for i := len(tx.Entries) - 1; i >= 0; i-- {
-		entry := tx.Entries[i]
-		if err := protocol.ValidateRelativePath(entry.Path); err != nil {
-			return fmt.Errorf("invalid archive transaction path")
-		}
-		final := filepath.Join(s.Root, "hosts", host, harness, filepath.FromSlash(entry.Path))
-		backup := filepath.Join(stageDir, fmt.Sprintf("backup-%06d", i))
-		if committed {
-			continue
-		}
-		if entry.HadFinal {
-			if st, e := os.Lstat(backup); e == nil {
-				if !st.Mode().IsRegular() {
-					return fmt.Errorf("invalid transaction backup")
-				}
-				if fst, fe := os.Lstat(final); fe == nil {
-					if !fst.Mode().IsRegular() || fst.Mode()&os.ModeSymlink != 0 {
-						return fmt.Errorf("unsafe transaction target")
-					}
-					if err := os.Remove(final); err != nil {
-						return err
-					}
-				}
-				if err := secureUnder(s.Root, filepath.Dir(final)); err != nil {
-					return err
-				}
-				if err := os.Rename(backup, final); err != nil {
-					return err
-				}
-				if err := safepath.SyncDir(filepath.Dir(final)); err != nil {
-					return err
-				}
-			}
-		} else if st, e := os.Lstat(final); e == nil {
-			if !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0 {
-				return fmt.Errorf("unsafe transaction target")
-			}
-			if err := os.Remove(final); err != nil {
-				return err
-			}
-			if err := safepath.SyncDir(filepath.Dir(final)); err != nil {
-				return err
-			}
-		}
-	}
-	if err := os.Remove(journalPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := safepath.SyncDir(filepath.Dir(journalPath)); err != nil {
-		return err
-	}
-	if err := os.RemoveAll(stageDir); err != nil {
-		return err
-	}
-	return nil
-}
 func (b *Batch) BindRoots(roots []string) error {
 	b.roots = append([]string(nil), roots...)
 	p := filepath.Join(b.store.Root, "state", b.host, b.harness+".json")
 	if st, e := os.Lstat(p); e == nil && (st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular()) {
 		return fmt.Errorf("unsafe prior manifest")
 	}
-	f, err := openRegularNoFollow(p)
+	f, err := safepath.OpenRegular(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -434,7 +120,7 @@ func hashFile(path string) (string, uint64, error) {
 	if lst.Mode()&os.ModeSymlink != 0 || !lst.Mode().IsRegular() {
 		return "", 0, fmt.Errorf("archive target is not a regular file")
 	}
-	f, e := openRegularNoFollow(path)
+	f, e := safepath.OpenRegular(path)
 	if e != nil {
 		return "", 0, e
 	}
@@ -576,98 +262,6 @@ func (b *Batch) PutJSONStream(path string, max uint64, body io.Reader) (bool, ui
 	defer f.Close()
 	u, err := b.Put(path, uint64(n), f)
 	return u, uint64(n), err
-}
-func (b *Batch) Commit(now time.Time) (written, unchanged uint64, err error) {
-	entries := make([]Entry, 0, len(b.files))
-	changes := make([]staged, 0, len(b.files))
-	for _, s := range b.files {
-		entries = append(entries, s.entry)
-		if s.unchanged {
-			unchanged++
-		} else {
-			changes = append(changes, s)
-		}
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
-	manifestPath := filepath.Join(b.store.Root, "state", b.host, b.harness+".json")
-	manifest := Manifest{Version: 1, Destination: b.destination, Harness: b.harness, CollectorVersion: b.collectorVersion, CollectedAt: now.UTC(), Roots: b.roots, Entries: entries}
-	if len(changes) == 0 {
-		defer b.close()
-		err = atomicJSON(manifestPath, manifest)
-		return
-	}
-	txID := filepath.Base(b.stageDir)
-	tx := transaction{Version: 1, ID: txID, Stage: txID, Entries: make([]transactionEntry, 0, len(changes))}
-	for _, s := range changes {
-		if err = secureUnder(b.store.Root, filepath.Dir(s.final)); err != nil {
-			b.close()
-			return
-		}
-		had := false
-		if st, e := os.Lstat(s.final); e == nil {
-			if !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0 {
-				err = fmt.Errorf("unsafe archive target %s", s.entry.Path)
-				b.close()
-				return
-			}
-			had = true
-		} else if !errors.Is(e, os.ErrNotExist) {
-			err = e
-			b.close()
-			return
-		}
-		tx.Entries = append(tx.Entries, transactionEntry{Path: s.entry.Path, HadFinal: had})
-	}
-	journalPath := filepath.Join(b.store.Root, "state", b.host, b.harness+".txn.json")
-	if err = atomicJSON(journalPath, tx); err != nil {
-		b.close()
-		return
-	}
-	defer func() {
-		if err != nil {
-			if recoverErr := b.store.recoverTransaction(b.host, b.harness); recoverErr != nil {
-				err = errors.Join(err, fmt.Errorf("recover archive transaction: %w", recoverErr))
-			}
-		}
-		b.close()
-	}()
-	for i, s := range changes {
-		if tx.Entries[i].HadFinal {
-			backup := filepath.Join(b.stageDir, fmt.Sprintf("backup-%06d", i))
-			if err = os.Rename(s.final, backup); err != nil {
-				return
-			}
-			if err = safepath.SyncDir(b.stageDir); err != nil {
-				return
-			}
-			if err = safepath.SyncDir(filepath.Dir(s.final)); err != nil {
-				return
-			}
-		}
-	}
-	for _, s := range changes {
-		if err = os.Rename(s.path, s.final); err != nil {
-			return
-		}
-		if err = safepath.SyncDir(filepath.Dir(s.final)); err != nil {
-			return
-		}
-		if err = safepath.SyncDir(b.stageDir); err != nil {
-			return
-		}
-		written++
-	}
-	manifest.TransactionID = txID
-	if err = atomicJSON(manifestPath, manifest); err != nil {
-		return
-	}
-	if err = os.Remove(journalPath); err != nil {
-		return
-	}
-	if err = safepath.SyncDir(filepath.Dir(journalPath)); err != nil {
-		return
-	}
-	return
 }
 func (b *Batch) Abort() { b.close() }
 func (b *Batch) close() {

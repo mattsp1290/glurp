@@ -7,36 +7,53 @@ import (
 	"github.com/mattsp1290/slurp/internal/config"
 )
 
-func filesystemScript(id ID, host config.Host) string {
-	var roots []string
-	var auto, command, match, logical string
+type filesystemHarness struct {
+	roots   []string
+	auto    string
+	command string
+	match   string
+	logical string
+}
+
+func describeFilesystemHarness(id ID, host config.Host) filesystemHarness {
 	switch id {
 	case Claude:
-		roots = host.Sources.Claude
-		command = "claude"
-		auto = `if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ "${CLAUDE_CONFIG_DIR#/}" != "$CLAUDE_CONFIG_DIR" ]; then root=$CLAUDE_CONFIG_DIR/projects; else root=$HOME/.claude/projects; fi`
-		match = "*.jsonl"
-		logical = "plain"
+		return filesystemHarness{
+			roots:   host.Sources.Claude,
+			command: "claude",
+			auto:    `if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ "${CLAUDE_CONFIG_DIR#/}" != "$CLAUDE_CONFIG_DIR" ]; then root=$CLAUDE_CONFIG_DIR/projects; else root=$HOME/.claude/projects; fi`,
+			match:   "*.jsonl",
+			logical: "plain",
+		}
 	case Codex:
-		roots = host.Sources.Codex
-		command = "codex"
-		auto = `if [ -n "${CODEX_HOME:-}" ] && [ "${CODEX_HOME#/}" != "$CODEX_HOME" ]; then root=$CODEX_HOME; else root=$HOME/.codex; fi`
-		match = "codex"
-		logical = "codex"
+		return filesystemHarness{
+			roots:   host.Sources.Codex,
+			command: "codex",
+			auto:    `if [ -n "${CODEX_HOME:-}" ] && [ "${CODEX_HOME#/}" != "$CODEX_HOME" ]; then root=$CODEX_HOME; else root=$HOME/.codex; fi`,
+			match:   "codex",
+			logical: "codex",
+		}
 	case Pi:
-		roots = host.Sources.Pi
-		command = "pi"
-		auto = `if [ -n "${PI_CODING_AGENT_SESSION_DIR:-}" ] && [ "${PI_CODING_AGENT_SESSION_DIR#/}" != "$PI_CODING_AGENT_SESSION_DIR" ]; then root=$PI_CODING_AGENT_SESSION_DIR; elif [ -n "${PI_CODING_AGENT_DIR:-}" ] && [ "${PI_CODING_AGENT_DIR#/}" != "$PI_CODING_AGENT_DIR" ]; then root=$PI_CODING_AGENT_DIR/sessions; else root=$HOME/.pi/agent/sessions; fi`
-		match = "*.jsonl"
-		logical = "plain"
+		return filesystemHarness{
+			roots:   host.Sources.Pi,
+			command: "pi",
+			auto:    `if [ -n "${PI_CODING_AGENT_SESSION_DIR:-}" ] && [ "${PI_CODING_AGENT_SESSION_DIR#/}" != "$PI_CODING_AGENT_SESSION_DIR" ]; then root=$PI_CODING_AGENT_SESSION_DIR; elif [ -n "${PI_CODING_AGENT_DIR:-}" ] && [ "${PI_CODING_AGENT_DIR#/}" != "$PI_CODING_AGENT_DIR" ]; then root=$PI_CODING_AGENT_DIR/sessions; else root=$HOME/.pi/agent/sessions; fi`,
+			match:   "*.jsonl",
+			logical: "plain",
+		}
 	}
+	panic("unsupported filesystem harness: " + id)
+}
+
+func filesystemScript(id ID, host config.Host) string {
+	d := describeFilesystemHarness(id, host)
 	var calls strings.Builder
-	if len(roots) > 0 {
-		for i, p := range roots {
+	if len(d.roots) > 0 {
+		for i, p := range d.roots {
 			calls.WriteString(fmt.Sprintf("collect_root %s %s || fail=1\n", shellQuote(p), shellQuote(fmt.Sprintf("root-%04d/", i+1))))
 		}
 	} else {
-		calls.WriteString(auto + "\n")
+		calls.WriteString(d.auto + "\n")
 		if id == Codex {
 			calls.WriteString("if { [ -d \"$root/sessions\" ] && [ ! -L \"$root/sessions\" ]; } || { [ -d \"$root/archived_sessions\" ] && [ ! -L \"$root/archived_sessions\" ]; } || { [ -f \"$root/session_index.jsonl\" ] && [ ! -L \"$root/session_index.jsonl\" ]; }; then collect_root \"$root\" '' || fail=1; fi\n")
 		} else {
@@ -84,5 +101,5 @@ if [ "$found" -eq 0 ]; then
  exit 0
 fi
 printf 'T\000ok\000\000%%s\000E\000' "$version"
-	`, shellQuote(command), shellQuote(command), shellQuote(logical), shellQuote(match), calls.String(), len(roots))
+	`, shellQuote(d.command), shellQuote(d.command), shellQuote(d.logical), shellQuote(d.match), calls.String(), len(d.roots))
 }

@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"github.com/mattsp1290/slurp/internal/safepath"
 	"golang.org/x/sys/unix"
@@ -42,77 +41,14 @@ func (s Store) RemoveHost(name string) error {
 }
 
 func ensureDir(path string) error {
-	path = filepath.Clean(path)
-	if err := safepath.CheckTrustedParents(path); err != nil {
-		return err
-	}
-	if err := rejectSymlinkComponents(path); err != nil {
-		return err
-	}
-	st, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(path, 0700); err != nil {
-			return err
-		}
-		return os.Chmod(path, 0700)
-	}
-	if err != nil {
-		return err
-	}
-	if st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
-		return fmt.Errorf("unsafe directory %s", path)
-	}
-	if st.Mode().Perm() != 0700 {
-		if err := os.Chmod(path, 0700); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func rejectSymlinkComponents(path string) error {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return err
-	}
-	cur := string(os.PathSeparator)
-	for _, part := range strings.Split(strings.TrimPrefix(abs, string(os.PathSeparator)), string(os.PathSeparator)) {
-		if part == "" {
-			continue
-		}
-		cur = filepath.Join(cur, part)
-		st, e := os.Lstat(cur)
-		if errors.Is(e, os.ErrNotExist) {
-			continue
-		}
-		if e != nil {
-			return e
-		}
-		if st.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("unsafe symlinked path component %s", cur)
-		}
-	}
-	return nil
-}
-
-func openLock(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW, 0600)
-	if err != nil {
-		return nil, err
-	}
-	f := os.NewFile(uintptr(fd), path)
-	if err := f.Chmod(0600); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return f, nil
+	return safepath.EnsureDir(path, 0700)
 }
 
 func (s Store) Load() (Config, error) {
 	if err := safepath.CheckTrustedParents(s.Path); err != nil {
 		return Config{}, err
 	}
-	if err := rejectSymlinkComponents(filepath.Dir(s.Path)); err != nil {
+	if err := safepath.CheckNoSymlinkComponents(filepath.Dir(s.Path)); err != nil {
 		return Config{}, err
 	}
 	lst, lerr := os.Lstat(s.Path)
@@ -182,7 +118,7 @@ func (s Store) mutate(fn func(*Config) error) error {
 	if err := ensureDir(dir); err != nil {
 		return fmt.Errorf("prepare config directory: %w", err)
 	}
-	lock, err := openLock(s.Path + ".lock")
+	lock, err := safepath.OpenLock(s.Path + ".lock")
 	if err != nil {
 		return err
 	}
