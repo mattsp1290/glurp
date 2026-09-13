@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mattsp1290/slurp/internal/protocol"
-	"github.com/mattsp1290/slurp/internal/safepath"
+	"github.com/mattsp1290/glurp/internal/protocol"
+	"github.com/mattsp1290/glurp/internal/safepath"
 )
 
 func (s Store) recoverTransaction(host, harness string) error {

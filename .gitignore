@@ -32,5 +32,5 @@ go.work.sum
 # .vscode/
 
 # Local and release builds
-/slurp
+/glurp
 /dist/

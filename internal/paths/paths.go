@@ -40,7 +40,7 @@ func Resolve(configOverride, dataOverride string, env map[string]string) (Paths,
 		if e != nil {
 			return Paths{}, e
 		}
-		cfg = filepath.Join(b, "slurp", "config.json")
+		cfg = filepath.Join(b, "glurp", "config.json")
 	}
 	data, err := abs(dataOverride)
 	if err != nil {
@@ -51,7 +51,7 @@ func Resolve(configOverride, dataOverride string, env map[string]string) (Paths,
 		if e != nil {
 			return Paths{}, e
 		}
-		data = filepath.Join(b, "slurp")
+		data = filepath.Join(b, "glurp")
 	}
 	return Paths{Config: cfg, DataDir: data}, nil
 }

@@ -7,10 +7,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/mattsp1290/slurp/internal/archive"
-	"github.com/mattsp1290/slurp/internal/config"
-	"github.com/mattsp1290/slurp/internal/protocol"
-	sshtransport "github.com/mattsp1290/slurp/internal/ssh"
+	"github.com/mattsp1290/glurp/internal/archive"
+	"github.com/mattsp1290/glurp/internal/config"
+	"github.com/mattsp1290/glurp/internal/protocol"
+	sshtransport "github.com/mattsp1290/glurp/internal/ssh"
 )
 
 type ID string

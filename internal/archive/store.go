@@ -12,8 +12,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/mattsp1290/slurp/internal/protocol"
-	"github.com/mattsp1290/slurp/internal/safepath"
+	"github.com/mattsp1290/glurp/internal/protocol"
+	"github.com/mattsp1290/glurp/internal/safepath"
 	"golang.org/x/sys/unix"
 )
 

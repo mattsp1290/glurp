@@ -6,8 +6,8 @@ import (
 	"syscall"
 
 	"charm.land/fang/v2"
-	"github.com/mattsp1290/slurp/internal/buildinfo"
-	"github.com/mattsp1290/slurp/internal/cli"
+	"github.com/mattsp1290/glurp/internal/buildinfo"
+	"github.com/mattsp1290/glurp/internal/cli"
 )
 
 func main() {

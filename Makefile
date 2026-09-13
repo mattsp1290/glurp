@@ -3,7 +3,7 @@ GO_FILES := $(shell find cmd internal -name '*.go' -type f | LC_ALL=C sort)
 .PHONY: build test vet fmt-check check
 
 build:
-	go build ./cmd/slurp
+	go build ./cmd/glurp
 
 test:
 	go test -race ./...

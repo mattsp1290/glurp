@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mattsp1290/slurp/internal/archive"
-	"github.com/mattsp1290/slurp/internal/config"
-	"github.com/mattsp1290/slurp/internal/harness"
+	"github.com/mattsp1290/glurp/internal/archive"
+	"github.com/mattsp1290/glurp/internal/config"
+	"github.com/mattsp1290/glurp/internal/harness"
 )
 
 type Selection struct {

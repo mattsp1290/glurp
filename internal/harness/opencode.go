@@ -10,8 +10,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/mattsp1290/slurp/internal/archive"
-	"github.com/mattsp1290/slurp/internal/config"
+	"github.com/mattsp1290/glurp/internal/archive"
+	"github.com/mattsp1290/glurp/internal/config"
 )
 
 var sessionID = regexp.MustCompile(`^ses_[A-Za-z0-9_-]+$`)
@@ -38,8 +38,8 @@ func collectOpenCode(ctx context.Context, r Runner, host config.Host, b *archive
 	})
 	script := `#!/bin/sh
 platform=$(uname -s 2>/dev/null || printf unknown)
-case "$platform" in Linux|Darwin) ;; *) printf 'SLURP_UNSUPPORTED_PLATFORM\n'; exit 0;; esac
-if ! command -v opencode >/dev/null 2>&1; then printf 'SLURP_OPENCODE_NOT_FOUND\n'; exit 0; fi
+case "$platform" in Linux|Darwin) ;; *) printf 'GLURP_UNSUPPORTED_PLATFORM\n'; exit 0;; esac
+if ! command -v opencode >/dev/null 2>&1; then printf 'GLURP_OPENCODE_NOT_FOUND\n'; exit 0; fi
 exec opencode db 'SELECT id FROM session ORDER BY id' --format json
 `
 	_, err := r.Run(ctx, host.Destination, script, func(rd io.Reader) error {
@@ -57,10 +57,10 @@ exec opencode db 'SELECT id FROM session ORDER BY id' --format json
 	if err != nil {
 		return Result{}, fmt.Errorf("OpenCode inventory failed: %w", err)
 	}
-	if string(raw) == "SLURP_OPENCODE_NOT_FOUND\n" {
+	if string(raw) == "GLURP_OPENCODE_NOT_FOUND\n" {
 		return Result{Status: "not-found", Version: "unknown"}, nil
 	}
-	if string(raw) == "SLURP_UNSUPPORTED_PLATFORM\n" {
+	if string(raw) == "GLURP_UNSUPPORTED_PLATFORM\n" {
 		return Result{}, fmt.Errorf("unsupported remote platform")
 	}
 	var rows []struct {

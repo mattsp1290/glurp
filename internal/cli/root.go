@@ -5,8 +5,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/mattsp1290/slurp/internal/harness"
-	sshtransport "github.com/mattsp1290/slurp/internal/ssh"
+	"github.com/mattsp1290/glurp/internal/harness"
+	sshtransport "github.com/mattsp1290/glurp/internal/ssh"
 	"github.com/spf13/cobra"
 )
 
@@ -45,11 +45,11 @@ func NewRoot(d Dependencies) *cobra.Command {
 		d.Environ = map[string]string{}
 	}
 	o := &options{}
-	cmd := &cobra.Command{Use: "slurp", Short: "Privately archive remote AI coding chats", Args: cobra.NoArgs, SilenceUsage: true, RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() }}
+	cmd := &cobra.Command{Use: "glurp", Short: "Privately archive remote AI coding chats", Args: cobra.NoArgs, SilenceUsage: true, RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() }}
 	cmd.SetOut(d.Stdout)
 	cmd.SetErr(d.Stderr)
 	cmd.PersistentFlags().StringVar(&o.configPath, "config", "", "configuration file path")
 	cmd.PersistentFlags().StringVar(&o.dataDir, "data-dir", "", "archive data directory")
-	cmd.AddCommand(newHostCommand(d, o), newSlurpCommand(d, o))
+	cmd.AddCommand(newHostCommand(d, o), newGlurpCommand(d, o))
 	return cmd
 }

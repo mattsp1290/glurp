@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mattsp1290/slurp/internal/archive"
-	"github.com/mattsp1290/slurp/internal/config"
-	sshtransport "github.com/mattsp1290/slurp/internal/ssh"
+	"github.com/mattsp1290/glurp/internal/archive"
+	"github.com/mattsp1290/glurp/internal/config"
+	sshtransport "github.com/mattsp1290/glurp/internal/ssh"
 )
 
 type shellRunner struct{ home, tmpdir string }

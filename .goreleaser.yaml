@@ -1,9 +1,9 @@
 version: 2
 
 builds:
-  - id: slurp
-    main: ./cmd/slurp
-    binary: slurp
+  - id: glurp
+    main: ./cmd/glurp
+    binary: glurp
     env:
       - CGO_ENABLED=0
     goos:
@@ -14,8 +14,8 @@ builds:
       - arm64
     ldflags:
       - -s -w
-      - -X github.com/mattsp1290/slurp/internal/buildinfo.Version={{.Version}}
-      - -X github.com/mattsp1290/slurp/internal/buildinfo.Commit={{.Commit}}
+      - -X github.com/mattsp1290/glurp/internal/buildinfo.Version={{.Version}}
+      - -X github.com/mattsp1290/glurp/internal/buildinfo.Commit={{.Commit}}
 
 archives:
   - formats: [tar.gz]

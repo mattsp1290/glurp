@@ -10,7 +10,7 @@ import (
 	"unicode/utf8"
 )
 
-const Magic = "SLURP\x00\x01\x00"
+const Magic = "GLURP\x00\x01\x00"
 
 type Limits struct{ MaxFileBytes, MaxFiles, MaxTotalBytes, MaxMetadataBytes uint64 }
 type Artifact struct {

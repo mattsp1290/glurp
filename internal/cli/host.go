@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/mattsp1290/slurp/internal/config"
-	pathutil "github.com/mattsp1290/slurp/internal/paths"
+	"github.com/mattsp1290/glurp/internal/config"
+	pathutil "github.com/mattsp1290/glurp/internal/paths"
 	"github.com/spf13/cobra"
 )
 
@@ -50,7 +50,7 @@ func newHostCommand(d Dependencies, o *options) *cobra.Command {
 			return nil
 		}
 		if len(c.Hosts) == 0 {
-			fmt.Fprintln(d.Stdout, "no hosts configured; add one with 'slurp host add <name> <destination>'")
+			fmt.Fprintln(d.Stdout, "no hosts configured; add one with 'glurp host add <name> <destination>'")
 			return nil
 		}
 		for _, h := range c.Hosts {

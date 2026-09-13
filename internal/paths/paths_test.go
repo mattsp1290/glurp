@@ -10,15 +10,19 @@ func TestResolve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Config != "/home/test/.config/slurp/config.json" || p.DataDir != "/data/slurp" {
+	if p.Config != "/home/test/.config/glurp/config.json" || p.DataDir != "/data/glurp" {
 		t.Fatalf("unexpected paths: %#v", p)
 	}
-	p, err = Resolve("cfg.json", "archive", map[string]string{})
+	legacy := "s" + "lurp"
+	p, err = Resolve(filepath.Join(legacy, "config.json"), legacy, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !filepath.IsAbs(p.Config) || !filepath.IsAbs(p.DataDir) {
 		t.Fatalf("overrides were not absolute: %#v", p)
+	}
+	if filepath.Base(filepath.Dir(p.Config)) != legacy || filepath.Base(p.DataDir) != legacy {
+		t.Fatalf("explicit legacy override was not retained: %#v", p)
 	}
 }
 func TestResolveRequiresHome(t *testing.T) {

@@ -3,10 +3,11 @@ package cli
 import (
 	"bytes"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/mattsp1290/slurp/internal/harness"
+	"github.com/mattsp1290/glurp/internal/harness"
 )
 
 func testRoot(t *testing.T) (*bytes.Buffer, Dependencies, *options) {
@@ -45,7 +46,7 @@ func TestSelectionFailsBeforeSSH(t *testing.T) {
 	}
 	calls := 0
 	d.NewRunner = func() (harness.Runner, error) { calls++; return nil, nil }
-	for _, args := range [][]string{{"--config", cfg, "slurp", "missing"}, {"--config", cfg, "slurp", "--harness", "wrong"}, {"--config", cfg, "slurp", "--jobs", "0"}} {
+	for _, args := range [][]string{{"--config", cfg, "glurp", "missing"}, {"--config", cfg, "glurp", "--harness", "wrong"}, {"--config", cfg, "glurp", "--jobs", "0"}} {
 		root = NewRoot(d)
 		root.SetArgs(args)
 		if err := root.Execute(); err == nil {
@@ -54,5 +55,25 @@ func TestSelectionFailsBeforeSSH(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("opened SSH %d times", calls)
+	}
+	root = NewRoot(d)
+	root.SetArgs([]string{strings.Join([]string{"s", "lurp"}, ""), "known"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("legacy collection command was accepted: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("legacy command opened SSH %d times", calls)
+	}
+}
+
+func TestRootAndCollectionUseGlurp(t *testing.T) {
+	_, d, _ := testRoot(t)
+	root := NewRoot(d)
+	if root.Use != "glurp" {
+		t.Fatalf("root use = %q", root.Use)
+	}
+	cmd, _, err := root.Find([]string{"glurp"})
+	if err != nil || cmd.Use != "glurp [host-name ...]" {
+		t.Fatalf("collection command = %#v, %v", cmd, err)
 	}
 }

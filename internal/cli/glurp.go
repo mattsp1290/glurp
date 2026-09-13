@@ -5,18 +5,18 @@ import (
 	"sort"
 	"time"
 
-	"github.com/mattsp1290/slurp/internal/archive"
-	"github.com/mattsp1290/slurp/internal/collect"
-	"github.com/mattsp1290/slurp/internal/harness"
+	"github.com/mattsp1290/glurp/internal/archive"
+	"github.com/mattsp1290/glurp/internal/collect"
+	"github.com/mattsp1290/glurp/internal/harness"
 	"github.com/spf13/cobra"
 )
 
-func newSlurpCommand(d Dependencies, o *options) *cobra.Command {
+func newGlurpCommand(d Dependencies, o *options) *cobra.Command {
 	var hs []string
 	var jobs int
 	var timeout time.Duration
 	var maxFile, maxFiles, maxTotal uint64
-	cmd := &cobra.Command{Use: "slurp [host-name ...]", Short: "Collect chat archives from configured hosts", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "glurp [host-name ...]", Short: "Collect chat archives from configured hosts", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		if jobs < 1 || jobs > 32 {
 			return fmt.Errorf("--jobs must be between 1 and 32")
 		}
@@ -45,7 +45,7 @@ func newSlurpCommand(d Dependencies, o *options) *cobra.Command {
 			return e
 		}
 		if len(cfg.Hosts) == 0 {
-			return fmt.Errorf("no hosts configured; run 'slurp host add <name> <destination>'")
+			return fmt.Errorf("no hosts configured; run 'glurp host add <name> <destination>'")
 		}
 		byName := map[string]struct{}{}
 		for _, n := range args {

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mattsp1290/slurp/internal/config"
+	"github.com/mattsp1290/glurp/internal/config"
 )
 
 type filesystemHarness struct {
@@ -62,7 +62,7 @@ func filesystemScript(id ID, host config.Host) string {
 	}
 	return fmt.Sprintf(`#!/bin/sh
 set -f
-printf 'SLURP\000\001\000'
+printf 'GLURP\000\001\000'
 platform=$(uname -s 2>/dev/null || printf unknown)
 case "$platform" in Linux|Darwin) ;; *) printf 'T\000failed\000unsupported remote platform\000unknown\000E\000'; exit 0;; esac
 if command -v %s >/dev/null 2>&1; then installed=1; version=$(%s --version 2>/dev/null | sed -n '1p'); else installed=0; version=unknown; fi

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/mattsp1290/slurp/internal/safepath"
+	"github.com/mattsp1290/glurp/internal/safepath"
 )
 
 func secureDir(path string) error {

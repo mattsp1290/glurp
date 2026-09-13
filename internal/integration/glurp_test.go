@@ -35,8 +35,11 @@ func TestCLIEndToEndWithFakeSSH(t *testing.T) {
 	}
 	repo := filepath.Clean(filepath.Join("..", ".."))
 	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "slurp")
-	cmd := exec.Command("go", "build", "-o", bin, "./cmd/slurp")
+	if e := os.Chmod(tmp, 0700); e != nil {
+		t.Fatal(e)
+	}
+	bin := filepath.Join(tmp, "glurp")
+	cmd := exec.Command("go", "build", "-o", bin, "./cmd/glurp")
 	cmd.Dir = repo
 	if b, e := cmd.CombinedOutput(); e != nil {
 		t.Fatalf("build: %v\n%s", e, b)
@@ -66,14 +69,26 @@ esac
 	if e := os.WriteFile(filepath.Join(fakeBin, "opencode"), []byte(opencodeScript), 0700); e != nil {
 		t.Fatal(e)
 	}
-	cfg := filepath.Join(tmp, "config.json")
-	data := filepath.Join(tmp, "data")
-	env := append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"), "NO_COLOR=1")
-	base := []string{"--config", cfg, "--data-dir", data}
+	clientHome := filepath.Join(tmp, "client-home")
+	configHome := filepath.Join(tmp, "config")
+	dataHome := filepath.Join(tmp, "data")
+	cfg := filepath.Join(configHome, "glurp", "config.json")
+	data := filepath.Join(dataHome, "glurp")
+	env := append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"), "NO_COLOR=1", "HOME="+clientHome, "XDG_CONFIG_HOME="+configHome, "XDG_DATA_HOME="+dataHome)
+	base := []string{}
 	if out, e := run(t, env, bin, append(base, "host", "add", "good", "good")...); e != nil {
 		t.Fatalf("add: %v %s", e, out)
 	}
-	out, e := run(t, env, bin, append(base, "slurp", "good")...)
+	if _, e := os.Stat(cfg); e != nil {
+		t.Fatalf("default Glurp config was not created: %v", e)
+	}
+	if _, e := os.Stat(filepath.Join(configHome, "s"+"lurp", "config.json")); !os.IsNotExist(e) {
+		t.Fatalf("legacy config path was unexpectedly used: %v", e)
+	}
+	if _, e := os.Stat(filepath.Join(dataHome, "s"+"lurp")); !os.IsNotExist(e) {
+		t.Fatalf("legacy archive path was unexpectedly used: %v", e)
+	}
+	out, e := run(t, env, bin, append(base, "glurp", "good")...)
 	if e != nil {
 		t.Fatalf("collect: %v\n%s", e, out)
 	}
@@ -100,7 +115,7 @@ esac
 		}
 		mtimes[p] = st.ModTime().UnixNano()
 	}
-	out, e = run(t, env, bin, append(base, "slurp", "good")...)
+	out, e = run(t, env, bin, append(base, "glurp", "good")...)
 	if e != nil {
 		t.Fatalf("repeat: %v\n%s", e, out)
 	}
@@ -117,7 +132,7 @@ esac
 	if e := os.Remove(remotePi); e != nil {
 		t.Fatal(e)
 	}
-	if out, e = run(t, env, bin, append(base, "slurp", "good", "--harness", "pi")...); e != nil {
+	if out, e = run(t, env, bin, append(base, "glurp", "good", "--harness", "pi")...); e != nil {
 		t.Fatalf("deletion retention run: %v\n%s", e, out)
 	}
 	if _, e = os.Stat(filepath.Join(data, "hosts", "good", "pi/demo/session.jsonl")); e != nil {
@@ -127,7 +142,7 @@ esac
 	if e = os.WriteFile(remoteClaude, []byte("updated synthetic transcript\n"), 0600); e != nil {
 		t.Fatal(e)
 	}
-	if out, e = run(t, env, bin, append(base, "slurp", "good", "--harness", "claude")...); e != nil {
+	if out, e = run(t, env, bin, append(base, "glurp", "good", "--harness", "claude")...); e != nil {
 		t.Fatalf("update run: %v\n%s", e, out)
 	}
 	if got, _ := os.ReadFile(filepath.Join(data, "hosts", "good", "claude/demo/session.jsonl")); string(got) != "updated synthetic transcript\n" {
@@ -136,7 +151,7 @@ esac
 	if out, e = run(t, env, bin, append(base, "host", "add", "bad", "bad")...); e != nil {
 		t.Fatal(out, e)
 	}
-	out, e = run(t, env, bin, append(base, "slurp")...)
+	out, e = run(t, env, bin, append(base, "glurp")...)
 	if e == nil || !strings.Contains(out, "good/claude") || !strings.Contains(out, "bad/claude: failed") {
 		t.Fatalf("partial failure behavior: err=%v\n%s", e, out)
 	}

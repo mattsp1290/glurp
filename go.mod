@@ -1,4 +1,4 @@
-module github.com/mattsp1290/slurp
+module github.com/mattsp1290/glurp
 
 go 1.25.0
 

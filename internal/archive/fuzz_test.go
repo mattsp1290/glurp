@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mattsp1290/slurp/internal/protocol"
+	"github.com/mattsp1290/glurp/internal/protocol"
 )
 
 func FuzzRelativePath(f *testing.F) {
