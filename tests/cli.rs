@@ -24,7 +24,9 @@ impl Fixture {
             fs::create_dir(dir).unwrap();
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        for utility in ["sh", "cat", "cksum", "find", "mktemp", "rm", "wc", "touch"] {
+        for utility in [
+            "sh", "cat", "cksum", "find", "mktemp", "rm", "wc", "touch", "sleep",
+        ] {
             let system = ["/bin", "/usr/bin"]
                 .into_iter()
                 .map(|directory| PathBuf::from(directory).join(utility))
@@ -56,16 +58,21 @@ exec /bin/sh -s
         }
     }
 
-    fn command(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_glurp"))
+    fn process(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_glurp"));
+        command
+            .env_clear()
             .args(args)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join("config"))
             .env("XDG_DATA_HOME", self.home.join("data"))
             .env("REMOTE_HOME", &self.remote)
-            .env("PATH", &self.bin)
-            .output()
-            .unwrap()
+            .env("PATH", &self.bin);
+        command
+    }
+
+    fn command(&self, args: &[&str]) -> Output {
+        self.process(args).output().unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> Output {
@@ -170,6 +177,9 @@ fn failed_host_does_not_prevent_good_host_and_diagnostics_are_suppressed() {
         fs::read(f.archive("session_index.jsonl")).unwrap(),
         b"synthetic\n"
     );
+    let repeated = f.command(&["glurp"]);
+    assert_eq!(out.stdout, repeated.stdout);
+    assert_eq!(out.stderr, repeated.stderr);
 }
 
 #[test]
@@ -593,6 +603,353 @@ exec "$shell" -c "$callback" sh "$1" "$2" "$3" "$HOME/isolated.jsonl"
             )
             .unwrap(),
             b"isolated pi bytes"
+        );
+    }
+}
+
+impl Fixture {
+    fn fake_ssh(&self, body: &str) {
+        fs::write(self.bin.join("ssh"), format!("#!/bin/sh\n{body}\n")).unwrap();
+    }
+    fn bounded(&self, args: &[&str], signal: Option<i32>) -> Output {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        let mut child = self
+            .process(args)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let mut signalled = false;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if !signalled && started.elapsed() > Duration::from_millis(200) {
+                if let Some(signal) = signal {
+                    unsafe {
+                        libc::kill(child.id() as i32, signal);
+                    }
+                }
+                signalled = true;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+                panic!("collector exceeded five-second fixture deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.wait_with_output().unwrap()
+    }
+}
+
+#[test]
+fn configured_limits_and_overflow_refuse_updates_and_preserve_mtimes() {
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    f.source("session_index.jsonl", b"old data");
+    f.ok(&["glurp", "--harness", "codex"]);
+    let before = fs::metadata(f.archive("session_index.jsonl"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    f.source("session_index.jsonl", b"new data");
+    for flags in [
+        ["--max-file-bytes", "7"],
+        ["--max-total-bytes", "7"],
+        ["--max-files", "0"],
+        ["--max-files", "18446744073709551615"],
+        ["--max-total-bytes", "18446744073709551615"],
+        ["--timeout-seconds", "0"],
+    ] {
+        assert!(
+            !f.bounded(&["glurp", "--harness", "codex", flags[0], flags[1]], None)
+                .status
+                .success()
+        );
+        assert_eq!(
+            fs::read(f.archive("session_index.jsonl")).unwrap(),
+            b"old data"
+        );
+        assert_eq!(
+            fs::metadata(f.archive("session_index.jsonl"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
+    }
+    f.ok(&[
+        "glurp",
+        "--harness",
+        "codex",
+        "--max-file-bytes",
+        "8",
+        "--max-total-bytes",
+        "8",
+        "--max-files",
+        "1",
+    ]);
+    assert_eq!(
+        fs::read(f.archive("session_index.jsonl")).unwrap(),
+        b"new data"
+    );
+}
+
+#[test]
+fn opencode_inventory_and_exports_share_count_and_byte_budgets() {
+    let f = Fixture::new();
+    let inventory = r#"[{"id":"ses_a"},{"id":"ses_b"}]"#;
+    f.opencode(
+        inventory,
+        r#"printf '{"info":{"id":"%s"},"messages":[]}\n' "$2""#,
+    );
+    f.ok(&["host", "add", "lab", "lab"]);
+    let export = "{\"info\":{\"id\":\"ses_a\"},\"messages\":[]}\n";
+    let exact_total = (inventory.len() + 1 + export.len() * 2).to_string();
+    f.ok(&[
+        "glurp",
+        "--harness",
+        "opencode",
+        "--max-files",
+        "3",
+        "--max-total-bytes",
+        &exact_total,
+    ]);
+    let path = f.home.join("data/glurp/hosts/lab/opencode/ses_a.json");
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    for flags in [
+        ("--max-files", "2".to_string()),
+        (
+            "--max-total-bytes",
+            (exact_total.parse::<usize>().unwrap() - 1).to_string(),
+        ),
+        ("--max-file-bytes", "20".to_string()),
+    ] {
+        assert!(
+            !f.command(&["glurp", "--harness", "opencode", flags.0, &flags.1])
+                .status
+                .success()
+        );
+        assert_eq!(fs::read(&path).unwrap(), export.as_bytes());
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+    }
+}
+
+#[test]
+fn cooperating_archive_writer_is_refused_before_ssh() {
+    use fs2::FileExt;
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    f.source("session_index.jsonl", b"old");
+    f.ok(&["glurp", "--harness", "codex"]);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.home.join("data/glurp/hosts/lab/archive.lock"))
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+    f.fake_ssh(&format!("touch '{}'", f.home.join("ssh-called").display()));
+    assert!(
+        !f.bounded(&["glurp", "--harness", "codex"], None)
+            .status
+            .success()
+    );
+    assert!(!f.home.join("ssh-called").exists());
+    assert_eq!(fs::read(f.archive("session_index.jsonl")).unwrap(), b"old");
+}
+
+#[test]
+fn timeout_signals_malformed_streams_and_stderr_flood_are_bounded() {
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    f.source("session_index.jsonl", b"prior committed data");
+    f.ok(&["glurp", "--harness", "codex"]);
+    for (script, signal) in [
+        ("cat >/dev/null\nsleep 30", None),
+        // The process doesn't read stdin, testing nonblocking script delivery too.
+        (
+            "while :; do printf 'PRIVATE-STDERR-SECRET\\n' >&2; done",
+            None,
+        ),
+        (
+            "cat >/dev/null\nprintf 'malformed PRIVATE-TRANSCRIPT-SECRET'",
+            None,
+        ),
+        ("cat >/dev/null\nsleep 30 &\nwait", Some(libc::SIGINT)),
+        ("cat >/dev/null\nsleep 30 &\nwait", Some(libc::SIGTERM)),
+        (
+            "cat >/dev/null\nprintf 'GLURP1\\000F\\000a\\00018446744073709551616\\000'",
+            None,
+        ),
+        (
+            "cat >/dev/null\nprintf 'GLURP1\\000F\\000a\\0009\\000short'",
+            None,
+        ),
+    ] {
+        f.fake_ssh(script);
+        let output = f.bounded(
+            &["glurp", "--harness", "codex", "--timeout-seconds", "1"],
+            signal,
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("PRIVATE-"));
+        assert_eq!(
+            fs::read(f.archive("session_index.jsonl")).unwrap(),
+            b"prior committed data"
+        );
+        assert!(!f.home.join("data/glurp/hosts/lab/.transaction").exists());
+    }
+}
+
+// Executed only as a disposable fake-SSH helper. It deliberately escapes the
+// SSH process group and retains the stdout pipe, proving the poll loop has no
+// blocking worker join even in a case group termination cannot close the pipe.
+#[test]
+fn escaped_pipe_fixture() {
+    let Some(pid_file) = std::env::var_os("GLURP_FIXTURE_ESCAPED_PID") else {
+        return;
+    };
+    unsafe {
+        let pid = libc::fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            libc::setsid();
+            libc::sleep(10);
+            libc::_exit(0);
+        }
+        fs::write(pid_file, pid.to_string()).unwrap();
+    }
+}
+
+#[test]
+fn escaped_inherited_pipe_cannot_hang_transport_after_timeout() {
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    let pid_file = f.home.join("escaped.pid");
+    let helper = std::env::current_exe().unwrap();
+    f.fake_ssh(&format!("cat >/dev/null\nexport GLURP_FIXTURE_ESCAPED_PID='{}'\nexec '{}' --exact escaped_pipe_fixture --nocapture", pid_file.display(), helper.display()));
+    let result = f.bounded(
+        &["glurp", "--harness", "codex", "--timeout-seconds", "1"],
+        None,
+    );
+    // Clean the deliberately escaped disposable helper explicitly.
+    let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    assert!(!result.status.success());
+}
+
+#[test]
+fn cancellation_reaps_ssh_process_group() {
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let pid_file = f.home.join("ssh.pid");
+        f.fake_ssh(&format!(
+            "cat >/dev/null\nprintf '%s' \"$$\" > '{}'\nexec sleep 30",
+            pid_file.display()
+        ));
+        let result = f.bounded(
+            &["glurp", "--harness", "codex", "--timeout-seconds", "30"],
+            Some(signal),
+        );
+        let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        assert!(!result.status.success());
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "SSH child was not reaped"
+        );
+    }
+}
+
+#[test]
+fn archive_batch_is_not_limited_by_one_descriptor_per_artifact() {
+    use std::os::unix::process::CommandExt;
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    for index in 0..180 {
+        f.source(
+            &format!("sessions/directory-{index}/artifact.jsonl"),
+            b"first batch",
+        );
+    }
+    for expected in [b"first batch".as_slice(), b"second batch".as_slice()] {
+        if expected == b"second batch" {
+            for index in 0..180 {
+                f.source(
+                    &format!("sessions/directory-{index}/artifact.jsonl"),
+                    expected,
+                );
+            }
+        }
+        let mut command = f.process(&["glurp", "--harness", "codex"]);
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 64,
+                    rlim_max: 64,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for index in 0..180 {
+            assert_eq!(
+                fs::read(f.archive(&format!("sessions/directory-{index}/artifact.jsonl"))).unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn interrupted_transport_and_wire_flood_preserve_committed_data() {
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    f.source("session_index.jsonl", b"original");
+    f.ok(&["glurp", "--harness", "codex"]);
+    for script in [
+        "cat >/dev/null\nprintf 'GLURP1\\000F\\000session_index.jsonl\\0007\\000changed'\nexit 9",
+        "while :; do printf 'PRIVATE-TRANSCRIPT-FLOOD'; done",
+    ] {
+        f.fake_ssh(script);
+        let output = f.bounded(
+            &[
+                "glurp",
+                "--harness",
+                "codex",
+                "--max-files",
+                "1",
+                "--max-total-bytes",
+                "8",
+                "--timeout-seconds",
+                "1",
+            ],
+            None,
+        );
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE-"));
+        assert_eq!(
+            fs::read(f.archive("session_index.jsonl")).unwrap(),
+            b"original"
         );
     }
 }

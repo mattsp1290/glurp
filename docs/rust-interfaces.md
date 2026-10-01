@@ -14,33 +14,33 @@ SSH destination. Config and archive operations use separate exclusive locks.
 All managed directories are 0700 and files are 0600. Symlinked or untrusted
 parents, nonregular files and hardlinked managed files are rejected.
 
-`remote::fetch(destination, script, spool)` invokes OpenSSH with BatchMode=yes
-and ConnectTimeout=15 and sends a fixed POSIX sh script on stdin. It suppresses
-remote stderr and spools at most 1 GiB to a private temporary file. The operation
-has a 300 second timeout; process-group termination also closes inherited pipes.
-Other harnesses should implement fixed scripts or rigorously quoted literal
-arguments without evaluating configured paths.
+`remote::fetch` invokes OpenSSH with BatchMode=yes and ConnectTimeout=15 and
+sends a fixed POSIX sh script on nonblocking stdin. It suppresses remote stderr
+and spools a bounded stream to a private descriptor-relative file. A shared task
+deadline and wire budget cover both OpenCode operations. Timeout and cancellation
+terminate the SSH process group and close inherited pipes without worker joins.
+Other harnesses implement fixed scripts or rigorously quoted literal arguments
+without evaluating configured paths. See [rust-safety.md](rust-safety.md) for CLI
+limits, durable recovery, and filesystem guarantees.
 
 Wire format version 1 is `GLURP1 NUL`, followed by zero or more artifacts:
 `F NUL relative-path NUL decimal-byte-count NUL exact-payload`, then exactly one `T NUL ok|not-found NUL`, followed by `E NUL`
 and EOF. No newline separators or text transformations occur. Paths must be
 UTF-8, at most 4096 bytes, relative, and contain no empty, dot, parent, newline,
-carriage-return or backslash components. Sizes are unsigned decimal, bounded to
-256 MiB per artifact, 1 GiB per stream and 100000 artifacts. Duplicate paths,
+carriage-return or backslash components. Sizes are unsigned decimal, bounded by configurable
+file/count/total budgets (defaults: 256 MiB per artifact, 1 GiB total payload,
+100000 artifacts). Duplicate paths,
 unknown frames, truncation, overflow and trailing bytes fail validation.
 
-`archive::stage(reader, directory)` validates a complete stream into private
-staging and returns artifact paths and a found/not-found status. `archive::collect` publishes only after SSH succeeds and staging passes.
-Unchanged artifacts preserve exact bytes and mtimes. Changed artifacts are
-individually replaced by same-filesystem rename; missing remote artifacts remain.
-The next safety slice must add transaction-wide rollback for local publication
-failures, configurable limits/timeouts, cancellation tests and descriptor-relative
-filesystem traversal to close same-user parent replacement races. Current locks
-coordinate cooperating Glurp processes; they do not prevent another process
-running as the same user from racing pathname checks. Source checksums detect
-ordinary source changes during transfer but remote filesystem traversal also
-has same-user races. Automatic absent harnesses return not-found success; configured missing roots or
-detected executables with unresolved source data fail with redacted guidance.
+The internal staging parser validates a complete stream into private anchored
+storage and returns artifact paths and a found/not-found status. Collection
+publishes only after SSH succeeds and staging passes. Unchanged artifacts
+preserve exact bytes and mtimes; missing remote artifacts remain. Full-batch
+preflight, synced backups, and a durable bounded journal permit transaction-wide
+rollback and recovery on the next run. All local filesystem operations use
+open directory descriptors and no-follow traversal. Automatic absent harnesses
+return not-found success; configured missing roots or detected executables with
+unresolved source data fail with redacted guidance.
 
 Configured roots are literal absolute paths or exact `~/` prefixes; only that
 prefix expands to the remote HOME. No shell expansion or evaluation occurs.

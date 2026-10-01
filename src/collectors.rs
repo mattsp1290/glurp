@@ -1,9 +1,11 @@
 //! Literal script generation and OpenCode's global inventory contract.
 use crate::config::Host;
+use crate::remote::{CheckedReader, Deadline};
+use crate::secure::Dir;
 use anyhow::{Result, bail};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::path::Path;
+use std::io::BufReader;
 
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -77,16 +79,19 @@ printf 'T\000ok\000E\000'
     format!("{OPEN_PRELUDE}{check}")
 }
 
-pub fn inventory(directory: &Path) -> Result<Vec<String>> {
-    let value: Value =
-        serde_json::from_reader(std::fs::File::open(directory.join("inventory.json"))?)
-            .map_err(|_| anyhow::anyhow!("OpenCode inventory is not valid JSON"))?;
+pub fn inventory(directory: &Dir, deadline: &Deadline) -> Result<Vec<String>> {
+    let value: Value = serde_json::from_reader(BufReader::new(CheckedReader {
+        reader: directory.read("inventory.json")?,
+        deadline,
+    }))
+    .map_err(|_| anyhow::anyhow!("OpenCode inventory is not valid JSON"))?;
     let rows = value
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("OpenCode inventory must be an array"))?;
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
     for row in rows {
+        deadline.check()?;
         let obj = row
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("OpenCode inventory row must be an object"))?;
@@ -124,17 +129,27 @@ pub fn exports(ids: &[String]) -> String {
     script
 }
 
-pub fn validate_exports(directory: &Path, ids: &[String], paths: &[String]) -> Result<()> {
+pub fn validate_exports(
+    directory: &Dir,
+    ids: &[String],
+    paths: &[String],
+    deadline: &Deadline,
+) -> Result<()> {
     if paths.len() != ids.len() {
         bail!("OpenCode exports do not match inventory");
     }
+    let paths: HashSet<_> = paths.iter().collect();
     for id in ids {
+        deadline.check()?;
         let path = format!("{id}.json");
         if !paths.contains(&path) {
             bail!("OpenCode export missing");
         }
-        let value: Value = serde_json::from_reader(std::fs::File::open(directory.join(path))?)
-            .map_err(|_| anyhow::anyhow!("OpenCode export is not one valid JSON document"))?;
+        let value: Value = serde_json::from_reader(BufReader::new(CheckedReader {
+            reader: directory.read(&path)?,
+            deadline,
+        }))
+        .map_err(|_| anyhow::anyhow!("OpenCode export is not one valid JSON document"))?;
         if value
             .get("info")
             .and_then(|i| i.get("id"))
@@ -145,6 +160,7 @@ pub fn validate_exports(directory: &Path, ids: &[String], paths: &[String]) -> R
             bail!("OpenCode export schema or session identity mismatch");
         }
         for message in value["messages"].as_array().unwrap() {
+            deadline.check()?;
             if !message.get("info").is_some_and(Value::is_object)
                 || !message.get("parts").is_some_and(Value::is_array)
             {

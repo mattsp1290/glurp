@@ -3,7 +3,6 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub struct Paths {
@@ -86,17 +85,17 @@ impl Host {
 
 pub struct Store {
     pub hosts: Vec<Host>,
-    path: PathBuf,
+    dir: secure::Dir,
     _lock: File,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        secure::directory(path.parent().context("config parent missing")?)?;
-        let lock = secure::file(&path.with_extension("lock"), true)?;
+        let dir = secure::Dir::open(path.parent().context("config parent missing")?, true)?;
+        let lock = dir.file("config.lock", true)?;
         lock.try_lock_exclusive()
             .context("configuration is in use; retry later")?;
-        let hosts: Vec<Host> = match secure::file(path, false) {
+        let hosts: Vec<Host> = match dir.file("config.json", false) {
             Ok(file) => {
                 serde_json::from_reader(file).context("invalid config.json; repair or remove it")?
             }
@@ -117,18 +116,13 @@ impl Store {
         }
         Ok(Self {
             hosts,
-            path: path.to_owned(),
+            dir,
             _lock: lock,
         })
     }
 
     fn save(&self) -> Result<()> {
-        let mut temp = tempfile::NamedTempFile::new_in(self.path.parent().unwrap())?;
-        serde_json::to_writer_pretty(&mut temp, &self.hosts)?;
-        temp.write_all(b"\n")?;
-        temp.as_file().sync_all()?;
-        temp.persist(&self.path)?;
-        Ok(())
+        self.dir.atomic_json("config.json", &self.hosts)
     }
 
     pub fn add(&mut self, host: Host, data: &Path) -> Result<()> {

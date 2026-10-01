@@ -1,34 +1,41 @@
-//! Archive interface: collect successful streams into staging, then publish.
-//! Artifact names are untrusted relative UTF-8 paths, independent of remote roots.
-use crate::{collectors, config::Host, remote, secure};
+//! Fully validate successful bounded streams before transaction publication.
+use crate::{
+    collectors,
+    config::Host,
+    limits::{Budget, Limits},
+    remote::{self, Deadline},
+    secure::{self, Dir},
+    transaction,
+};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use std::collections::HashSet;
-use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_FILES: usize = 100_000;
-
 pub fn check_binding(data: &Path, host: &Host) -> Result<()> {
-    // No archive yet: host registration must not create transcript directories.
-    let base = data.join("hosts").join(&host.name);
-    if fs::symlink_metadata(&base).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
-        return Ok(());
-    }
-    secure::directory(&base)?;
-    let path = base.join("destination.json");
-    if path.exists() || fs::symlink_metadata(&path).is_ok() {
-        let bound: String = serde_json::from_reader(secure::file(&path, false)?)?;
+    let base = match Dir::open(&data.join("hosts").join(&host.name), false) {
+        Ok(base) => base,
+        Err(error) if secure::not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    verify_binding(&base, host)
+}
+fn verify_binding(base: &Dir, host: &Host) -> Result<()> {
+    if let Some(file) = base.optional_file("destination.json")? {
+        let bound: String = serde_json::from_reader(file.take(4096))?;
         if bound != host.destination {
             bail!("archive name is bound to a different destination; choose a new host name");
         }
+    } else if base
+        .entries()?
+        .iter()
+        .any(|name| matches!(name.as_str(), "claude" | "codex" | "pi" | "opencode"))
+    {
+        bail!("archive destination binding is missing; repair storage before collection");
     }
     Ok(())
 }
-
 fn token(reader: &mut impl BufRead) -> Result<String> {
     let mut bytes = Vec::new();
     let read = reader.take(4098).read_until(0, &mut bytes)?;
@@ -37,17 +44,22 @@ fn token(reader: &mut impl BufRead) -> Result<String> {
     }
     String::from_utf8(bytes).context("archive frame is not UTF-8")
 }
-
-pub fn stage(reader: impl Read, stage: &Path) -> Result<(Vec<String>, bool)> {
+fn stage(
+    reader: impl Read,
+    stage: &Dir,
+    limits: &Limits,
+    budget: &mut Budget,
+    deadline: &Deadline,
+) -> Result<(Vec<String>, bool)> {
     let mut reader = BufReader::new(reader);
     if token(&mut reader)? != "GLURP1" {
         bail!("unsupported archive protocol");
     }
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
-    let mut total = 0_u64;
     let mut status: Option<bool> = None;
     loop {
+        deadline.check()?;
         match token(&mut reader)?.as_str() {
             "E" => {
                 if !reader.fill_buf()?.is_empty() {
@@ -74,110 +86,104 @@ pub fn stage(reader: impl Read, stage: &Path) -> Result<(Vec<String>, bool)> {
         }
         let path = token(&mut reader)?;
         secure::relative(&path)?;
-        if !seen.insert(path.clone()) || paths.len() >= MAX_FILES {
-            bail!("duplicate artifact or file count limit exceeded");
+        if !seen.insert(path.clone()) {
+            bail!("duplicate artifact path");
         }
         let raw_size = token(&mut reader)?;
         if raw_size.is_empty() || !raw_size.bytes().all(|b| b.is_ascii_digit()) {
             bail!("invalid artifact size");
         }
         let size = raw_size.parse::<u64>().context("artifact size overflow")?;
-        total = total.checked_add(size).context("archive total overflow")?;
-        if size > MAX_FILE_BYTES || total > remote::MAX_STREAM_BYTES {
-            bail!("archive size limit exceeded");
-        }
-        let target = stage.join(&path);
-        secure::directory(target.parent().unwrap())?;
-        let mut file = secure::file(&target, true)?;
-        let copied = std::io::copy(&mut reader.by_ref().take(size), &mut file)?;
-        if copied != size {
-            bail!("truncated artifact payload");
+        budget.add(size, limits)?;
+        let (parent, leaf) = stage.parent(&path, true)?;
+        let mut file = parent.create_new(&leaf)?;
+        let mut remaining = size;
+        let mut bytes = [0_u8; 64 * 1024];
+        while remaining > 0 {
+            deadline.check()?;
+            let len = remaining.min(bytes.len() as u64) as usize;
+            let count = reader.read(&mut bytes[..len])?;
+            if count == 0 {
+                bail!("truncated artifact payload");
+            }
+            std::io::Write::write_all(&mut file, &bytes[..count])?;
+            remaining -= count as u64;
         }
         file.sync_all()?;
+        parent.sync()?;
         paths.push(path);
     }
 }
-
-pub fn collect(data: &Path, host: &Host, harness: &str) -> Result<String> {
+pub fn collect(data: &Path, host: &Host, harness: &str, limits: &Limits) -> Result<String> {
     host.validate()?;
+    let deadline = Deadline::new(limits.timeout_seconds);
+    let mut wire_left = limits.wire_limit()?;
     let script = collectors::script(host, harness)?;
-    let base = data.join("hosts").join(&host.name);
-    secure::directory(&base)?;
-    let lock = secure::file(&base.join("archive.lock"), true)?;
+    let root = Dir::open(data, true)?;
+    let base = root.child("hosts", true)?.child(&host.name, true)?;
+    let lock = base.file("archive.lock", true)?;
     lock.try_lock_exclusive()
         .context("archive is in use; retry later")?;
-    check_binding(data, host)?;
-    let binding = base.join("destination.json");
-    if !binding.exists() {
-        let mut temp = tempfile::NamedTempFile::new_in(&base)?;
-        serde_json::to_writer(&mut temp, &host.destination)?;
-        temp.as_file().sync_all()?;
-        temp.persist(&binding)?;
+    verify_binding(&base, host)?;
+    transaction::recover(&base)?;
+    if base.optional_file("destination.json")?.is_none() {
+        base.atomic_json("destination.json", &host.destination)?;
     }
-    let staging = tempfile::Builder::new()
-        .prefix(".stage-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(&base)?;
-    let spool = tempfile::tempfile_in(staging.path())?;
-    let stream = remote::fetch(&host.destination, script, spool)?;
-    let artifacts = staging.path().join("artifacts");
-    secure::directory(&artifacts)?;
-    let (mut paths, found) = stage(stream, &artifacts)?;
-    if !found {
-        return Ok("not-found".into());
-    }
-    if harness == "opencode" {
-        if paths != ["inventory.json"] {
-            bail!("OpenCode inventory stream is invalid");
-        }
-        let ids = collectors::inventory(&artifacts)?;
-        fs::remove_file(artifacts.join("inventory.json"))?;
-        let spool = tempfile::tempfile_in(staging.path())?;
-        let stream = remote::fetch(&host.destination, collectors::exports(&ids), spool)?;
-        let (exports, found) = stage(stream, &artifacts)?;
+    let txn = base.child(".transaction", true)?;
+    let mut published = false;
+    let result = (|| {
+        let spool = txn.create_new("spool")?;
+        let stream = remote::fetch(&host.destination, script, spool, &deadline, &mut wire_left)?;
+        let artifacts = txn.child("artifacts", true)?;
+        let mut budget = Budget::new();
+        let (mut paths, found) = stage(stream, &artifacts, limits, &mut budget, &deadline)?;
         if !found {
-            bail!("OpenCode became unavailable after inventory");
+            return Ok("not-found".into());
         }
-        collectors::validate_exports(&artifacts, &ids, &exports)?;
-        paths = exports;
-    }
-    let archive = base.join(harness);
-    secure::directory(&archive)?;
-    for path in &paths {
-        let source = artifacts.join(path);
-        let target = archive.join(path);
-        secure::directory(target.parent().unwrap())?;
-        if fs::symlink_metadata(&target).is_ok() {
-            let existing = secure::file(&target, false)?;
-            // Exact byte comparison keeps unchanged files and their mtimes.
-            let mut a = BufReader::new(existing);
-            let mut b = BufReader::new(secure::file(&source, false)?);
-            let equal = loop {
-                let aa = a.fill_buf()?;
-                let bb = b.fill_buf()?;
-                let len = aa.len().min(bb.len());
-                if len == 0 {
-                    break aa.is_empty() && bb.is_empty();
-                }
-                if aa[..len] != bb[..len] {
-                    break false;
-                }
-                a.consume(len);
-                b.consume(len);
-            };
-            if equal {
-                continue;
+        if harness == "opencode" {
+            if paths != ["inventory.json"] {
+                bail!("OpenCode inventory stream is invalid");
             }
+            let ids = collectors::inventory(&artifacts, &deadline)?;
+            budget.ensure_exports(ids.len(), limits)?;
+            deadline.check()?;
+            artifacts.remove("inventory.json")?;
+            let spool = txn.create_new("exports-spool")?;
+            let stream = remote::fetch(
+                &host.destination,
+                collectors::exports(&ids),
+                spool,
+                &deadline,
+                &mut wire_left,
+            )?;
+            let (exports, found) = stage(stream, &artifacts, limits, &mut budget, &deadline)?;
+            if !found {
+                bail!("OpenCode became unavailable after inventory");
+            }
+            collectors::validate_exports(&artifacts, &ids, &exports, &deadline)?;
+            paths = exports;
         }
-        fs::rename(&source, &target)?;
+        deadline.check()?;
+        transaction::publish(&base, &txn, &artifacts, harness, &paths, &deadline)?;
+        published = true;
+        Ok(format!("collected {} artifacts", paths.len()))
+    })();
+    if published {
+        return result;
     }
-    fs::File::open(&archive)?.sync_all()?;
-    Ok(format!("collected {} artifacts", paths.len()))
+    // On validation failure, no ready journal exists. On publication failure,
+    // recover retries a durable rollback and retains backups if it still fails.
+    if transaction::recover(&base).is_err() {
+        bail!(
+            "archive transaction needs recovery; private backups retained, repair storage and retry"
+        );
+    }
+    result
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn hostile_frames_fail_without_publication() {
         for bytes in [
@@ -187,11 +193,21 @@ mod tests {
             b"GLURP1\0E\0trailing",
             b"GLURP1\0F\0ok\x000\0F\0ok\x000\0E\0",
         ] {
-            let dir = tempfile::Builder::new()
-                .permissions(fs::Permissions::from_mode(0o700))
+            let temp = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
                 .tempdir()
                 .unwrap();
-            assert!(stage(bytes, dir.path()).is_err());
+            let dir = Dir::open(&temp.path().canonicalize().unwrap(), true).unwrap();
+            assert!(
+                stage(
+                    bytes,
+                    &dir,
+                    &Limits::default(),
+                    &mut Budget::new(),
+                    &Deadline::new(5)
+                )
+                .is_err()
+            );
         }
     }
 }

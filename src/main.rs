@@ -1,8 +1,10 @@
 mod archive;
 mod collectors;
 mod config;
+mod limits;
 mod remote;
 mod secure;
+mod transaction;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -27,6 +29,8 @@ enum Commands {
         hosts: Vec<String>,
         #[arg(long, value_parser = ["claude", "codex", "pi", "opencode"])]
         harness: Vec<String>,
+        #[command(flatten)]
+        limits: limits::Limits,
     },
 }
 
@@ -52,8 +56,40 @@ enum HostCommand {
     Remove { name: String },
 }
 
+fn failure_reason(error: &anyhow::Error) -> &'static str {
+    // Only fixed local categories are printed. Never expose parser excerpts,
+    // remote artifact names, transcript bytes, or underlying SSH diagnostics.
+    let message = error.to_string();
+    if message.contains("archive is in use") {
+        "archive in use; retry later"
+    } else if message.contains("bound to a different") || message.contains("binding is missing") {
+        "archive destination binding refused"
+    } else if message.contains("timed out") {
+        "operation timed out"
+    } else if message.contains("cancelled") {
+        "collection cancelled"
+    } else if message.contains("recovery")
+        || message.contains("rollback")
+        || message.contains("backups retained")
+    {
+        "local recovery required; backups retained"
+    } else if message.contains("limit") || message.contains("overflow") {
+        "archive limit or size overflow"
+    } else if message.contains("frame")
+        || message.contains("protocol")
+        || message.contains("truncated")
+        || message.contains("unsafe artifact")
+        || message.contains("duplicate artifact")
+    {
+        "invalid remote archive stream"
+    } else {
+        "collection failed"
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    remote::install_cancellation()?;
     let paths = config::Paths::resolve()?;
     let mut store = config::Store::open(&paths.config)?;
     match cli.command {
@@ -90,12 +126,17 @@ fn run() -> Result<()> {
                 println!("host removed; archives retained");
             }
         },
-        Commands::Glurp { hosts, harness } => {
+        Commands::Glurp {
+            hosts,
+            harness,
+            limits,
+        } => {
+            limits.wire_limit()?;
             let selected = store.select(&hosts)?;
             // Release config lock before potentially slow SSH operations.
             drop(store);
             let mut failed = false;
-            let harnesses = if harness.is_empty() {
+            let mut harnesses = if harness.is_empty() {
                 vec![
                     "claude".into(),
                     "codex".into(),
@@ -105,9 +146,17 @@ fn run() -> Result<()> {
             } else {
                 harness
             };
+            harnesses.sort();
+            harnesses.dedup();
             for host in selected {
+                if remote::cancelled() {
+                    bail!("collection cancelled");
+                }
                 for harness in &harnesses {
-                    match archive::collect(&paths.data, &host, harness) {
+                    if remote::cancelled() {
+                        bail!("collection cancelled");
+                    }
+                    match archive::collect(&paths.data, &host, harness, &limits) {
                         Ok(result) => println!("{} {harness}: {result}", host.name),
                         Err(error) => {
                             failed = true;
@@ -123,7 +172,11 @@ fn run() -> Result<()> {
                                     "check OpenCode database access and inventory/export compatibility"
                                 }
                             };
-                            eprintln!("{} {harness}: {error:#}; {guidance}", host.name);
+                            eprintln!(
+                                "{} {harness}: {}; {guidance}; check configured limits, timeout and local storage",
+                                host.name,
+                                failure_reason(&error)
+                            );
                         }
                     }
                 }
