@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
@@ -48,9 +48,10 @@ fn unchanged(target: &Dir, leaf: &str, change: &Change) -> Result<Option<std::fs
     }
     Ok(current)
 }
-fn equal(a: std::fs::File, b: std::fs::File) -> Result<bool> {
+fn equal(a: std::fs::File, b: std::fs::File, deadline: &Deadline) -> Result<bool> {
     let (mut a, mut b) = (BufReader::new(a), BufReader::new(b));
     loop {
+        deadline.check()?;
         let aa = a.fill_buf()?;
         let bb = b.fill_buf()?;
         let len = aa.len().min(bb.len());
@@ -64,11 +65,32 @@ fn equal(a: std::fs::File, b: std::fs::File) -> Result<bool> {
         b.consume(len);
     }
 }
-fn copy_backup(mut old: std::fs::File, backups: &Dir, index: usize) -> Result<()> {
+fn copy_backup(
+    mut old: std::fs::File,
+    backups: &Dir,
+    index: usize,
+    deadline: Option<&Deadline>,
+) -> Result<()> {
     let meta = old.metadata()?;
     old.seek(SeekFrom::Start(0))?;
-    let backup = backups.create_new(&index.to_string())?;
-    std::io::copy(&mut old, &mut &backup)?;
+    let mut backup = backups.create_new(&index.to_string())?;
+    let mut bytes = [0_u8; 64 * 1024];
+    loop {
+        if let Some(deadline) = deadline {
+            deadline.check()?;
+        }
+        let count = old.read(&mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        if let Some(deadline) = deadline {
+            deadline.check()?;
+        }
+        backup.write_all(&bytes[..count])?;
+    }
+    if let Some(deadline) = deadline {
+        deadline.check()?;
+    }
     // Rollback preserves original timestamps, including unchanged entries that
     // had backups but were not reached before the publication failure.
     let times = [
@@ -92,16 +114,56 @@ fn valid_harness(harness: &str) -> bool {
 }
 
 pub fn recover(base: &Dir) -> Result<()> {
-    let txn = match base.child(".transaction", false) {
+    recover_inner(base, false)
+}
+/// A failed publication must never be reinterpreted as successful commit cleanup.
+pub fn recover_failed(base: &Dir) -> Result<()> {
+    recover_inner(base, true)
+}
+fn recover_inner(base: &Dir, failed: bool) -> Result<()> {
+    // .recovery records a failed decision transition whose reverse rename
+    // could not be completed. Its journal is always interpreted as rollback.
+    let recovery = match base.child(".recovery", false) {
+        Ok(dir) => Some(dir),
+        Err(error) if secure::not_found(&error) => None,
+        Err(error) => return Err(error),
+    };
+    let recovering = recovery.is_some();
+    let transaction_name = if recovering {
+        ".recovery"
+    } else {
+        ".transaction"
+    };
+    let txn = match recovery
+        .map(Ok)
+        .unwrap_or_else(|| base.child(".transaction", false))
+    {
         Ok(dir) => dir,
         Err(error) if secure::not_found(&error) => return Ok(()),
         Err(error) => return Err(error),
     };
-    if txn.optional_file("committed")?.is_some() && txn.optional_file("ready.json")?.is_none() {
-        base.remove_tree(".transaction")?;
+    let marked_failed = txn.optional_file(".rollback-required")?.is_some();
+    let rollback = failed || recovering || marked_failed;
+    if !rollback
+        && txn.optional_file("committed")?.is_some()
+        && txn.optional_file("ready.json")?.is_none()
+    {
+        base.remove_tree(transaction_name)?;
         return Ok(());
     }
-    if let Some(file) = txn.optional_file("ready.json")? {
+    if failed && !marked_failed && txn.optional_file("committed")?.is_some() {
+        // Record failed-publication intent before touching a single restore
+        // target. This is independent of both journal and parent renames.
+        // Even a subsequent sync failure leaves the visible marker conservative.
+        txn.create_new(".rollback-required")?.sync_all()?;
+        txn.sync()?;
+    }
+    let journal_name = if rollback && txn.optional_file("ready.json")?.is_none() {
+        "committed"
+    } else {
+        "ready.json"
+    };
+    if let Some(file) = txn.optional_file(journal_name)? {
         // The journal is locally generated, but must not accept arbitrary paths
         // or unbounded data if another process damaged the transaction.
         let journal: Journal = serde_json::from_reader(file.take(MAX_JOURNAL_BYTES))
@@ -134,7 +196,7 @@ pub fn recover(base: &Dir) -> Result<()> {
                 if txn.optional_file(&temp)?.is_some() {
                     txn.remove(&temp)?;
                 }
-                copy_backup(backups.file(&index.to_string(), false)?, &txn, index)?;
+                copy_backup(backups.file(&index.to_string(), false)?, &txn, index, None)?;
                 // copy_backup uses the numeric name in txn; backups remain untouched.
                 txn.rename(&index.to_string(), &parent, &leaf)?;
             } else if exists {
@@ -143,9 +205,9 @@ pub fn recover(base: &Dir) -> Result<()> {
         }
         // Once restoration is durable, clear the rollback instruction before
         // deleting any backup. A crash during cleanup cannot need deleted backups.
-        txn.remove("ready.json")?;
+        txn.remove(journal_name)?;
     }
-    base.remove_tree(".transaction")?;
+    base.remove_tree(transaction_name)?;
     Ok(())
 }
 
@@ -180,7 +242,11 @@ fn publish_with(
         let version = old.as_ref().map(version).transpose()?;
         let (source, source_leaf) = artifacts.parent(path, false)?;
         if let Some(existing) = old.as_ref()
-            && equal(existing.try_clone()?, source.file(&source_leaf, false)?)?
+            && equal(
+                existing.try_clone()?,
+                source.file(&source_leaf, false)?,
+                deadline,
+            )?
         {
             if Some(self::version(existing)?) != version {
                 bail!("concurrent archive modification detected");
@@ -198,7 +264,7 @@ fn publish_with(
         deadline.check()?;
         let (target, leaf) = archive.parent(&change.path, false)?;
         if let Some(old) = unchanged(&target, &leaf, change)? {
-            copy_backup(old, &backups, index)?;
+            copy_backup(old, &backups, index, Some(deadline))?;
         }
         unchanged(&target, &leaf, change)?;
         entries.push(Entry {
@@ -225,24 +291,28 @@ fn publish_with(
             checkpoint(index + 1)?;
         }
         deadline.check()?;
-        txn.create_new("committed")?.sync_all()?;
-        txn.sync()?;
-        // ready.json remains authoritative until the commit marker is durable.
-        // Recovery rolls back a marker whose sync failed or was interrupted.
-        txn.remove("ready.json")?;
+        // Move the complete durable journal; never unlink and reconstruct it.
+        // Either name always retains every rollback instruction and backup.
+        txn.rename_unsynced("ready.json", txn, "committed")?;
+        if let Err(error) = txn.sync() {
+            // Rename back does not depend on a successful metadata rewrite or
+            // sync. Recovery will see ready.json even if another fsync fails.
+            if txn.rename_unsynced("committed", txn, "ready.json").is_err() {
+                // Moving the parent records rollback intent even when the
+                // transaction directory itself no longer permits renames.
+                base.rename_unsynced(".transaction", base, ".recovery")
+                    .context("commit failed; rollback journal and backups need repair")?;
+                // No metadata rewriting is required. If this sync also fails,
+                // the visible .recovery state remains conservative on retry.
+                let _ = base.sync();
+            }
+            return Err(error);
+        }
         Ok(())
     })();
     if let Err(error) = result {
-        // unlink may have succeeded even if the following directory sync failed.
-        // Reinstate the durable rollback instruction before recovering.
-        if txn.optional_file("ready.json")?.is_none() {
-            txn.atomic_json_limited("ready.json", &journal, MAX_JOURNAL_BYTES)
-                .context("commit failed; backups retained and journal needs repair")?;
-        }
-        if recover(base).is_err() {
-            bail!(
-                "publication failed and rollback needs recovery; backups retained in .transaction"
-            );
+        if recover_failed(base).is_err() {
+            bail!("publication failed and rollback needs recovery; private backups retained");
         }
         return Err(error);
     }
@@ -351,7 +421,7 @@ mod tests {
         let archive = base.child("codex", false).unwrap();
         let backups = txn.child("backups", true).unwrap();
         for (index, path) in ["a", "b"].iter().enumerate() {
-            copy_backup(archive.read(path).unwrap(), &backups, index).unwrap();
+            copy_backup(archive.read(path).unwrap(), &backups, index, None).unwrap();
         }
         backups.sync().unwrap();
         txn.atomic_json(
@@ -372,7 +442,6 @@ mod tests {
         )
         .unwrap();
         artifacts.rename("a", &archive, "a").unwrap();
-        txn.create_new("committed").unwrap();
         // An obstacle causes rollback to stop safely with all originals retained.
         archive.rename("b", &archive, "blocked").unwrap();
         archive.child("b", true).unwrap();
@@ -382,6 +451,42 @@ mod tests {
         archive.remove_tree("b").unwrap();
         archive.rename("blocked", &archive, "b").unwrap();
         recover(&base).unwrap();
+        recover(&base).unwrap();
+        assert_eq!(read(&base, "a"), b"old-a");
+        assert_eq!(read(&base, "b"), b"old-b");
+    }
+    #[test]
+    fn interrupted_failed_commit_transition_recovers_from_preserved_journal_name() {
+        let (_temp, base, txn, artifacts) = setup();
+        let archive = base.child("codex", false).unwrap();
+        let backups = txn.child("backups", true).unwrap();
+        for (index, path) in ["a", "b"].iter().enumerate() {
+            copy_backup(archive.read(path).unwrap(), &backups, index, None).unwrap();
+        }
+        backups.sync().unwrap();
+        txn.atomic_json(
+            "ready.json",
+            &Journal {
+                harness: "codex".into(),
+                entries: vec![
+                    Entry {
+                        path: "a".into(),
+                        old: true,
+                    },
+                    Entry {
+                        path: "b".into(),
+                        old: true,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        artifacts.rename("a", &archive, "a").unwrap();
+        txn.rename_unsynced("ready.json", &txn, "committed")
+            .unwrap();
+        // Model an interrupted reverse transition in its conservative parent
+        // name. The complete journal is still usable without rewriting it.
+        base.rename(".transaction", &base, ".recovery").unwrap();
         recover(&base).unwrap();
         assert_eq!(read(&base, "a"), b"old-a");
         assert_eq!(read(&base, "b"), b"old-b");

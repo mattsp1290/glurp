@@ -131,6 +131,7 @@ pub fn collect(data: &Path, host: &Host, harness: &str, limits: &Limits) -> Resu
     }
     let txn = base.child(".transaction", true)?;
     let mut published = false;
+    let mut publication_attempted = false;
     let result = (|| {
         let spool = txn.create_new("spool")?;
         let stream = remote::fetch(&host.destination, script, spool, &deadline, &mut wire_left)?;
@@ -164,6 +165,7 @@ pub fn collect(data: &Path, host: &Host, harness: &str, limits: &Limits) -> Resu
             paths = exports;
         }
         deadline.check()?;
+        publication_attempted = true;
         transaction::publish(&base, &txn, &artifacts, harness, &paths, &deadline)?;
         published = true;
         Ok(format!("collected {} artifacts", paths.len()))
@@ -173,7 +175,12 @@ pub fn collect(data: &Path, host: &Host, harness: &str, limits: &Limits) -> Resu
     }
     // On validation failure, no ready journal exists. On publication failure,
     // recover retries a durable rollback and retains backups if it still fails.
-    if transaction::recover(&base).is_err() {
+    let recovery = if publication_attempted {
+        transaction::recover_failed(&base)
+    } else {
+        transaction::recover(&base)
+    };
+    if recovery.is_err() {
         bail!(
             "archive transaction needs recovery; private backups retained, repair storage and retry"
         );

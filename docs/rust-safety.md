@@ -71,14 +71,28 @@ restores *all* originals and removes newly introduced artifacts. Backups remain
 until restoration completes; a failed rollback retains the journal/backups and
 refuses further publication until storage is repaired.
 
-The commit marker is synced before the rollback journal is durably cleared.
-A marker alongside a rollback journal is treated as interrupted publication and
-rolled back. Recovery clears the journal only after all originals are restored,
-so recovery can itself be interrupted and repeated. Cleanup removes any commit
-marker last. An interrupted committed cleanup cannot reinterpret already
-removed backups as an unfinished rollback. The next collection performs recovery
-under the archive lock before contacting SSH. Orphan staging from a failed or
-interrupted validation is removed without touching committed transcripts.
+Commit atomically renames the complete synced rollback journal from `ready.json`
+to `committed`, then syncs the transaction directory. This successful directory
+sync is the commit boundary; subsequent cleanup failures do not turn a committed
+collection into a failed operation. A failed commit sync moves the same journal
+back to its rollback name without writing or serializing any metadata. If that
+reverse rename cannot complete, moving the transaction directory to `.recovery`
+records conservative rollback intent; recovery uses its retained journal and
+backups, including on a later invocation. No failed transition requires journal
+reconstruction. Explicit failed-publication recovery never uses generic committed
+cleanup; it records a `.rollback-required` marker before restoring committed-named
+rollback metadata. Both the inner publication handler and outer collection retry
+use that path. A later invocation honors the marker even after another recovery
+I/O failure. Recovery clears the rollback journal only after all originals
+are durably restored, so recovery can itself be interrupted and repeated.
+Cleanup removes the committed journal last. The next collection performs
+recovery under the archive lock before contacting SSH. Orphan staging from a
+failed or interrupted validation is removed without touching committed transcripts.
+
+Ordinary file comparison and backup preparation check the task deadline and
+cancellation between bounded chunks (64 KiB for copies). Rollback copies are
+also bounded per read/write but deliberately ignore a cancelled or expired
+collection deadline so committed originals can still be restored.
 
 These guarantees protect against untrusted paths and ordinary failures, and
 coordinate writers using Glurp's locks. A malicious process with the same UID
@@ -103,5 +117,9 @@ timeout, SIGINT/SIGTERM, reaped SSH, and an escaped inherited pipe. Deterministi
 unit fixtures force a real later rename failure after both an update and a new
 artifact have published, then verify full rollback and original mtimes. Recovery
 fixtures model interruption and an obstructed rollback, retain original backups,
-and retry recovery. Directory-swap fixtures prove anchored writes cannot escape
-through substituted symlinks.
+and retry recovery. Linux fault regressions compile a small test-only preload
+helper with the host C compiler: they inject repeated sync failures through full
+collection, fail the reverse transition, fault committed cleanup, and slow bounded
+local comparison/backup operations to verify timeout and both cancellation signals
+without large disk writes. Directory-swap fixtures prove anchored writes cannot
+escape through substituted symlinks.

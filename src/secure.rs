@@ -158,6 +158,11 @@ impl Dir {
         }
     }
     pub fn rename(&self, from: &str, dest: &Self, to: &str) -> Result<()> {
+        self.rename_unsynced(from, dest, to)?;
+        self.sync()?;
+        dest.sync()
+    }
+    pub fn rename_unsynced(&self, from: &str, dest: &Self, to: &str) -> Result<()> {
         let from = name(OsStr::new(from))?;
         let to = name(OsStr::new(to))?;
         if unsafe {
@@ -171,8 +176,7 @@ impl Dir {
         {
             return Err(io::Error::last_os_error().into());
         }
-        self.sync()?;
-        dest.sync()
+        Ok(())
     }
     pub fn remove(&self, part: &str) -> Result<()> {
         let part = name(OsStr::new(part))?;

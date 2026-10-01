@@ -953,3 +953,291 @@ fn interrupted_transport_and_wire_flood_preserve_committed_data() {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+impl Fixture {
+    fn fault_shim(&self) -> PathBuf {
+        let library = self.home.join("fs-faults.so");
+        let output = Command::new("cc")
+            .args(["-shared", "-fPIC", "-O2", "-o"])
+            .arg(&library)
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fs_faults.c"))
+            .arg("-ldl")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        library
+    }
+    fn wait_bounded(child: &mut std::process::Child) {
+        let started = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if started.elapsed() > std::time::Duration::from_secs(3) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("local filesystem processing ignored timeout/cancellation");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repeated_commit_and_restore_sync_failures_preserve_originals_through_collect_recovery() {
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    f.source("session_index.jsonl", b"original");
+    f.ok(&["glurp", "--harness", "codex"]);
+    let path = f.archive("session_index.jsonl");
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    f.source("session_index.jsonl", b"changed!");
+    let log = f.home.join("fault.log");
+    let output = f
+        .process(&["glurp", "--harness", "codex"])
+        .env("LD_PRELOAD", f.fault_shim())
+        .env("GLURP_FAULT_MODE", "commit-two-syncs")
+        .env("GLURP_FAULT_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        "commit-sync-failed\nrestore-sync-failed\n"
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"original");
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+    assert!(!f.home.join("data/glurp/hosts/lab/.transaction").exists());
+    // A later invocation must never discover a false committed cleanup state.
+    // Make SSH fail so only recovery can modify prior data.
+    f.fake_ssh("exit 9");
+    assert!(!f.command(&["glurp", "--harness", "codex"]).status.success());
+    assert_eq!(fs::read(path).unwrap(), b"original");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_backup_copy_observes_timeout_and_cancellation_without_large_disk_writes() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    for signal in [None, Some(libc::SIGINT), Some(libc::SIGTERM)] {
+        let f = Fixture::new();
+        f.ok(&["host", "add", "lab", "lab"]);
+        f.source("session_index.jsonl", b"original");
+        f.ok(&["glurp", "--harness", "codex"]);
+        let path = f.archive("session_index.jsonl");
+        let old = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        old.set_len(64 * 1024 * 1024).unwrap(); // sparse, synthetic original
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        f.source("session_index.jsonl", b"changed!");
+        let timeout = if signal.is_some() { "30" } else { "1" };
+        let mut child = f
+            .process(&["glurp", "--harness", "codex", "--timeout-seconds", timeout])
+            .env("LD_PRELOAD", f.fault_shim())
+            .env("GLURP_FAULT_MODE", "slow-backup")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Some(signal) = signal {
+            let started = Instant::now();
+            let backup = f.home.join("data/glurp/hosts/lab/.transaction/backups/0");
+            while fs::metadata(&backup).map_or(true, |meta| meta.len() < 64 * 1024) {
+                assert!(child.try_wait().unwrap().is_none());
+                if started.elapsed() > Duration::from_secs(3) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("copy fixture never reached a backup chunk");
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            unsafe {
+                libc::kill(child.id() as i32, signal);
+            }
+        }
+        Fixture::wait_bounded(&mut child);
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains(if signal.is_some() {
+                "cancelled"
+            } else {
+                "timed out"
+            }),
+            "{diagnostic}"
+        );
+        let mut original = fs::File::open(&path).unwrap();
+        let mut prefix = [0_u8; 8];
+        std::io::Read::read_exact(&mut original, &mut prefix).unwrap();
+        assert_eq!(&prefix, b"original");
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), before);
+        assert!(!f.home.join("data/glurp/hosts/lab/.transaction").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_reverse_transition_preserves_recovery_intent_and_postcommit_cleanup_is_success() {
+    for (mode, expected, succeeds, events) in [
+        (
+            "commit-reverse",
+            b"original".as_slice(),
+            false,
+            "commit-sync-failed\nreverse-rename-failed\n",
+        ),
+        (
+            "commit-cleanup",
+            b"changed!".as_slice(),
+            true,
+            "commit-sync-succeeded\ncleanup-sync-failed\n",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.ok(&["host", "add", "lab", "lab"]);
+        f.source("session_index.jsonl", b"original");
+        f.ok(&["glurp", "--harness", "codex"]);
+        f.source("session_index.jsonl", b"changed!");
+        let log = f.home.join("fault.log");
+        let output = f
+            .process(&["glurp", "--harness", "codex"])
+            .env("LD_PRELOAD", f.fault_shim())
+            .env("GLURP_FAULT_MODE", mode)
+            .env("GLURP_FAULT_LOG", &log)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(fs::read_to_string(log).unwrap().starts_with(events));
+        assert_eq!(
+            fs::read(f.archive("session_index.jsonl")).unwrap(),
+            expected
+        );
+        f.fake_ssh("exit 9");
+        assert!(!f.command(&["glurp", "--harness", "codex"]).status.success());
+        assert_eq!(
+            fs::read(f.archive("session_index.jsonl")).unwrap(),
+            expected
+        );
+        assert!(!f.home.join("data/glurp/hosts/lab/.transaction").exists());
+        assert!(!f.home.join("data/glurp/hosts/lab/.recovery").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_comparison_observes_timeout_and_both_cancellation_signals() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    for signal in [None, Some(libc::SIGINT), Some(libc::SIGTERM)] {
+        let f = Fixture::new();
+        f.ok(&["host", "add", "lab", "lab"]);
+        f.source("session_index.jsonl", b"original");
+        f.ok(&["glurp", "--harness", "codex"]);
+        let path = f.archive("session_index.jsonl");
+        for artifact in [&path, &f.remote.join(".codex/session_index.jsonl")] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(artifact)
+                .unwrap()
+                .set_len(16 * 1024 * 1024)
+                .unwrap();
+        }
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        let log = f.home.join("comparison.log");
+        let timeout = if signal.is_some() { "30" } else { "1" };
+        let mut child = f
+            .process(&["glurp", "--harness", "codex", "--timeout-seconds", timeout])
+            .env("LD_PRELOAD", f.fault_shim())
+            .env("GLURP_FAULT_MODE", "slow-compare")
+            .env("GLURP_FAULT_LOG", &log)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Some(signal) = signal {
+            let started = Instant::now();
+            while !log.exists() {
+                assert!(child.try_wait().unwrap().is_none());
+                if started.elapsed() > Duration::from_secs(3) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("fixture never reached comparison");
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            unsafe {
+                libc::kill(child.id() as i32, signal);
+            }
+        }
+        Fixture::wait_bounded(&mut child);
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(fs::read_to_string(log).unwrap(), "comparison-started\n");
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains(if signal.is_some() {
+                "cancelled"
+            } else {
+                "timed out"
+            }),
+            "{diagnostic}"
+        );
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), before);
+        assert!(!f.home.join("data/glurp/hosts/lab/.transaction").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn all_failed_transitions_and_restore_io_retain_authoritative_recovery_for_later_invocation() {
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    f.source("session_index.jsonl", b"original");
+    f.ok(&["glurp", "--harness", "codex"]);
+    let path = f.archive("session_index.jsonl");
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    f.source("session_index.jsonl", b"changed!");
+    let log = f.home.join("fault.log");
+    let output = f
+        .process(&["glurp", "--harness", "codex"])
+        .env("LD_PRELOAD", f.fault_shim())
+        .env("GLURP_FAULT_MODE", "commit-all-transitions")
+        .env("GLURP_FAULT_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let events = fs::read_to_string(log).unwrap();
+    for event in [
+        "commit-sync-failed",
+        "reverse-rename-failed",
+        "parent-rename-failed",
+        "restore-sync-failed",
+    ] {
+        assert!(events.contains(event), "{events}");
+    }
+    let txn = f.home.join("data/glurp/hosts/lab/.transaction");
+    assert_eq!(fs::read(txn.join("backups/0")).unwrap(), b"original");
+    assert!(txn.join("committed").is_file());
+    assert!(txn.join(".rollback-required").is_file());
+    // Remove all faults and make SSH fail: the next invocation must restore
+    // from committed-named rollback metadata *before* contacting SSH.
+    f.fake_ssh("exit 9");
+    assert!(!f.command(&["glurp", "--harness", "codex"]).status.success());
+    assert_eq!(fs::read(path).unwrap(), b"original");
+    assert_eq!(
+        fs::metadata(f.archive("session_index.jsonl"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before
+    );
+    assert!(!txn.exists());
+}
