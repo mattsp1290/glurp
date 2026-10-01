@@ -35,6 +35,12 @@ impl Paths {
 pub struct Host {
     pub name: String,
     pub destination: String,
+    #[serde(default)]
+    pub claude_paths: Vec<String>,
+    #[serde(default)]
+    pub codex_paths: Vec<String>,
+    #[serde(default)]
+    pub pi_paths: Vec<String>,
 }
 
 impl Host {
@@ -59,6 +65,20 @@ impl Host {
             bail!(
                 "destination must be an SSH alias or user@host without options or shell characters"
             );
+        }
+        for root in self
+            .claude_paths
+            .iter()
+            .chain(&self.codex_paths)
+            .chain(&self.pi_paths)
+        {
+            if !(root.starts_with('/') || root.starts_with("~/"))
+                || root.contains(['\0', '\n', '\r'])
+            {
+                bail!(
+                    "source roots must be absolute or start with ~/ and contain no control separators"
+                );
+            }
         }
         Ok(())
     }

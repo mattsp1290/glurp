@@ -10,9 +10,8 @@ use std::time::{Duration, Instant};
 
 pub const MAX_STREAM_BYTES: u64 = 1024 * 1024 * 1024;
 pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
-pub const CODEX_SCRIPT: &str = include_str!("codex.sh");
 
-pub fn fetch(destination: &str, script: &'static str, mut spool: File) -> Result<File> {
+pub fn fetch(destination: &str, script: String, mut spool: File) -> Result<File> {
     let mut child = Command::new("ssh")
         .args([
             "-o",

@@ -1,6 +1,6 @@
 //! Archive interface: collect successful streams into staging, then publish.
 //! Artifact names are untrusted relative UTF-8 paths, independent of remote roots.
-use crate::{config::Host, remote, secure};
+use crate::{collectors, config::Host, remote, secure};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use std::collections::HashSet;
@@ -38,7 +38,7 @@ fn token(reader: &mut impl BufRead) -> Result<String> {
     String::from_utf8(bytes).context("archive frame is not UTF-8")
 }
 
-pub fn stage(reader: impl Read, stage: &Path) -> Result<Vec<String>> {
+pub fn stage(reader: impl Read, stage: &Path) -> Result<(Vec<String>, bool)> {
     let mut reader = BufReader::new(reader);
     if token(&mut reader)? != "GLURP1" {
         bail!("unsupported archive protocol");
@@ -46,15 +46,30 @@ pub fn stage(reader: impl Read, stage: &Path) -> Result<Vec<String>> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
     let mut total = 0_u64;
+    let mut status: Option<bool> = None;
     loop {
         match token(&mut reader)?.as_str() {
             "E" => {
                 if !reader.fill_buf()?.is_empty() {
                     bail!("unexpected bytes after archive end");
                 }
-                return Ok(paths);
+                let found = status.context("missing terminal archive status")?;
+                if !found && !paths.is_empty() {
+                    bail!("not-found stream contains artifacts");
+                }
+                return Ok((paths, found));
             }
-            "F" => (),
+            "T" if status.is_none() => {
+                status = Some(match token(&mut reader)?.as_str() {
+                    "ok" => true,
+                    "not-found" => false,
+                    _ => bail!(
+                        "remote source discovery failed; check configured roots and permissions"
+                    ),
+                });
+                continue;
+            }
+            "F" if status.is_none() => (),
             _ => bail!("unknown archive frame"),
         }
         let path = token(&mut reader)?;
@@ -83,11 +98,9 @@ pub fn stage(reader: impl Read, stage: &Path) -> Result<Vec<String>> {
     }
 }
 
-pub fn collect(data: &Path, host: &Host, harness: &str) -> Result<usize> {
+pub fn collect(data: &Path, host: &Host, harness: &str) -> Result<String> {
     host.validate()?;
-    if harness != "codex" {
-        bail!("unsupported harness");
-    }
+    let script = collectors::script(host, harness)?;
     let base = data.join("hosts").join(&host.name);
     secure::directory(&base)?;
     let lock = secure::file(&base.join("archive.lock"), true)?;
@@ -106,10 +119,28 @@ pub fn collect(data: &Path, host: &Host, harness: &str) -> Result<usize> {
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(&base)?;
     let spool = tempfile::tempfile_in(staging.path())?;
-    let stream = remote::fetch(&host.destination, remote::CODEX_SCRIPT, spool)?;
+    let stream = remote::fetch(&host.destination, script, spool)?;
     let artifacts = staging.path().join("artifacts");
     secure::directory(&artifacts)?;
-    let paths = stage(stream, &artifacts)?;
+    let (mut paths, found) = stage(stream, &artifacts)?;
+    if !found {
+        return Ok("not-found".into());
+    }
+    if harness == "opencode" {
+        if paths != ["inventory.json"] {
+            bail!("OpenCode inventory stream is invalid");
+        }
+        let ids = collectors::inventory(&artifacts)?;
+        fs::remove_file(artifacts.join("inventory.json"))?;
+        let spool = tempfile::tempfile_in(staging.path())?;
+        let stream = remote::fetch(&host.destination, collectors::exports(&ids), spool)?;
+        let (exports, found) = stage(stream, &artifacts)?;
+        if !found {
+            bail!("OpenCode became unavailable after inventory");
+        }
+        collectors::validate_exports(&artifacts, &ids, &exports)?;
+        paths = exports;
+    }
     let archive = base.join(harness);
     secure::directory(&archive)?;
     for path in &paths {
@@ -141,7 +172,7 @@ pub fn collect(data: &Path, host: &Host, harness: &str) -> Result<usize> {
         fs::rename(&source, &target)?;
     }
     fs::File::open(&archive)?.sync_all()?;
-    Ok(paths.len())
+    Ok(format!("collected {} artifacts", paths.len()))
 }
 
 #[cfg(test)]
