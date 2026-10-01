@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -30,7 +31,7 @@ int fsync(int fd) {
     int (*real_fsync)(int) = dlsym(RTLD_NEXT, "fsync");
     const char *mode = getenv("GLURP_FAULT_MODE");
     char path[8192];
-    if (mode && (strcmp(mode, "commit-two-syncs") == 0 || strcmp(mode, "commit-reverse") == 0 || strcmp(mode, "commit-cleanup") == 0 || strcmp(mode, "commit-all-transitions") == 0) && path_for(fd, path, sizeof(path))) {
+    if (mode && (strcmp(mode, "commit-two-syncs") == 0 || strcmp(mode, "commit-reverse") == 0 || (strcmp(mode, "commit-cleanup") == 0 || strcmp(mode, "commit-partial-cleanup") == 0) || (strcmp(mode, "commit-all-transitions") == 0 || strcmp(mode, "commit-no-marker") == 0)) && path_for(fd, path, sizeof(path))) {
         size_t n = strlen(path);
         const char *suffix = "/.transaction";
         if (step == 0 && n >= strlen(suffix) && strcmp(path + n - strlen(suffix), suffix) == 0) {
@@ -39,11 +40,11 @@ int fsync(int fd) {
             snprintf(committed, sizeof(committed), "%s/committed", path);
             if (access(ready, F_OK) != 0 && access(committed, F_OK) == 0) {
                 step = 1;
-                if (strcmp(mode, "commit-cleanup") == 0) { record("commit-sync-succeeded\n"); return real_fsync(fd); }
+                if (strcmp(mode, "commit-cleanup") == 0 || strcmp(mode, "commit-partial-cleanup") == 0) { record("commit-sync-succeeded\n"); return real_fsync(fd); }
                 record("commit-sync-failed\n"); errno = EIO; return -1;
             }
         }
-        if (strcmp(mode, "commit-all-transitions") == 0 && step >= 1 && strstr(path, "/.transaction/0")) {
+        if ((strcmp(mode, "commit-all-transitions") == 0 || strcmp(mode, "commit-no-marker") == 0) && step >= 1 && strstr(path, "/.transaction/0")) {
             record("restore-sync-failed\n"); errno = EIO; return -1;
         }
         if (strcmp(mode, "commit-two-syncs") == 0 && step == 1 && strstr(path, "/.transaction/0")) {
@@ -58,7 +59,7 @@ int fsync(int fd) {
 int renameat(int oldfd, const char *oldname, int newfd, const char *newname) {
     int (*real_renameat)(int, const char *, int, const char *) = dlsym(RTLD_NEXT, "renameat");
     const char *mode = getenv("GLURP_FAULT_MODE");
-    if (mode && strcmp(mode, "commit-all-transitions") == 0 && step >= 1) {
+    if (mode && (strcmp(mode, "commit-all-transitions") == 0 || strcmp(mode, "commit-no-marker") == 0) && step >= 1) {
         if (strcmp(oldname, "committed") == 0 && strcmp(newname, "ready.json") == 0) {
             record("reverse-rename-failed\n"); errno = EACCES; return -1;
         }
@@ -91,4 +92,37 @@ ssize_t read(int fd, void *bytes, size_t count) {
         usleep(2000);
     }
     return real_read(fd, bytes, count);
+}
+
+static int marker_fault(const char *name, int flags) {
+    const char *mode = getenv("GLURP_FAULT_MODE");
+    if (mode && strcmp(mode, "commit-no-marker") == 0 && step >= 1 &&
+        (flags & O_CREAT) && strcmp(name, ".rollback-required") == 0) {
+        record("marker-create-failed\n"); errno = EIO; return 1;
+    }
+    return 0;
+}
+int openat(int fd, const char *name, int flags, ...) {
+    int (*real_openat)(int, const char *, int, ...) = dlsym(RTLD_NEXT, "openat");
+    mode_t permissions = 0;
+    if (flags & O_CREAT) { va_list args; va_start(args, flags); permissions = va_arg(args, int); va_end(args); }
+    if (marker_fault(name, flags)) return -1;
+    return real_openat(fd, name, flags, permissions);
+}
+int openat64(int fd, const char *name, int flags, ...) {
+    int (*real_openat)(int, const char *, int, ...) = dlsym(RTLD_NEXT, "openat64");
+    mode_t permissions = 0;
+    if (flags & O_CREAT) { va_list args; va_start(args, flags); permissions = va_arg(args, int); va_end(args); }
+    if (marker_fault(name, flags)) return -1;
+    return real_openat(fd, name, flags, permissions);
+}
+int unlinkat(int fd, const char *name, int flags) {
+    int (*real_unlinkat)(int, const char *, int) = dlsym(RTLD_NEXT, "unlinkat");
+    const char *mode = getenv("GLURP_FAULT_MODE");
+    char path[8192];
+    if (mode && strcmp(mode, "commit-partial-cleanup") == 0 && step >= 1 &&
+        strcmp(name, "1") == 0 && path_for(fd, path, sizeof(path)) && strstr(path, "/.transaction/backups")) {
+        record("partial-cleanup-failed\n"); errno = EIO; return -1;
+    }
+    return real_unlinkat(fd, name, flags);
 }

@@ -73,21 +73,45 @@ refuses further publication until storage is repaired.
 
 Commit atomically renames the complete synced rollback journal from `ready.json`
 to `committed`, then syncs the transaction directory. This successful directory
-sync is the commit boundary; subsequent cleanup failures do not turn a committed
-collection into a failed operation. A failed commit sync moves the same journal
-back to its rollback name without writing or serializing any metadata. If that
-reverse rename cannot complete, moving the transaction directory to `.recovery`
-records conservative rollback intent; recovery uses its retained journal and
-backups, including on a later invocation. No failed transition requires journal
-reconstruction. Explicit failed-publication recovery never uses generic committed
-cleanup; it records a `.rollback-required` marker before restoring committed-named
-rollback metadata. Both the inner publication handler and outer collection retry
-use that path. A later invocation honors the marker even after another recovery
-I/O failure. Recovery clears the rollback journal only after all originals
-are durably restored, so recovery can itself be interrupted and repeated.
-Cleanup removes the committed journal last. The next collection performs
-recovery under the archive lock before contacting SSH. Orphan staging from a
-failed or interrupted validation is removed without touching committed transcripts.
+sync is the commit boundary. Only the live publisher that verified that sync
+may delete backups as successful-commit cleanup; a cleanup error does not turn
+that successful collection into a failed operation.
+
+Restart recovery distinguishes these states under the archive lock, before SSH:
+
+| Visible state | Automatic action |
+| --- | --- |
+| `ready.json`, `.rollback-required`, or `.recovery` with a journal | Preflight and restore all originals; retain backups on error |
+| `committed` without known rollback authority | Refuse; preserve current artifacts, journal, and all remaining backups |
+| Staging without a journal | Remove staging; no artifact was published |
+
+A committed journal on restart is ambiguous: its directory sync may have failed,
+or the publisher may have succeeded and stopped during cleanup. Failed commit
+handling attempts to restore the ready name, move the parent to `.recovery`, or
+record `.rollback-required`; none of those fallible operations is necessary for
+safety. If all fail, automatic recovery still refuses to delete originals.
+
+Use `glurp recover HOST --rollback` to explicitly choose local rollback of a
+retained transaction. This can discard a possibly successful newest generation.
+The command verifies the configured host destination binding, takes the archive
+lock, and never contacts SSH. It validates the entire journal, every target path,
+and every required original backup before changing any target. For an ambiguous
+committed journal it establishes rollback authority after that preflight and
+before restoring anything. Backups remain until every original is durably
+restored; errors retain recovery evidence and permit retry. Recovery retires the
+journal only after restoration completes.
+
+Successful-commit cleanup can delete some backups before failing. In that case
+explicit rollback refuses before changing any target because complete restoration
+is impossible. Manual resolution is required: stop collection for that host,
+preserve a private copy of its entire archive directory (including hidden
+transaction directories, journal, remaining backups, and timestamps), inspect the
+journal and both generations, and restore missing originals from an independently
+verified copy if rollback is desired. If choosing to retain the current generation,
+verify all journal targets before retiring the transaction manually. Never remove
+remaining evidence merely to silence recovery errors; there is no automatic
+incomplete-backup rollback or cleanup command. Storage failure may prevent
+restoration, but never authorizes deletion of originals.
 
 Ordinary file comparison and backup preparation check the task deadline and
 cancellation between bounded chunks (64 KiB for copies). Rollback copies are

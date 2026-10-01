@@ -36,6 +36,16 @@ fn verify_binding(base: &Dir, host: &Host) -> Result<()> {
     }
     Ok(())
 }
+/// Explicit local rollback uses the same binding and exclusion as collection.
+pub fn rollback(data: &Path, host: &Host) -> Result<()> {
+    host.validate()?;
+    let base = Dir::open(&data.join("hosts").join(&host.name), false)?;
+    let lock = base.file("archive.lock", true)?;
+    lock.try_lock_exclusive()
+        .context("archive is in use; retry later")?;
+    verify_binding(&base, host)?;
+    transaction::rollback(&base)
+}
 fn token(reader: &mut impl BufRead) -> Result<String> {
     let mut bytes = Vec::new();
     let read = reader.take(4098).read_until(0, &mut bytes)?;

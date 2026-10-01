@@ -1126,6 +1126,16 @@ fn failed_reverse_transition_preserves_recovery_intent_and_postcommit_cleanup_is
             fs::read(f.archive("session_index.jsonl")).unwrap(),
             expected
         );
+        if succeeds {
+            let txn = f.home.join("data/glurp/hosts/lab/.transaction");
+            assert!(txn.join("committed").is_file());
+            assert_eq!(fs::read(txn.join("backups/0")).unwrap(), b"original");
+            f.ok(&["recover", "lab", "--rollback"]);
+            assert_eq!(
+                fs::read(f.archive("session_index.jsonl")).unwrap(),
+                b"original"
+            );
+        }
         assert!(!f.home.join("data/glurp/hosts/lab/.transaction").exists());
         assert!(!f.home.join("data/glurp/hosts/lab/.recovery").exists());
     }
@@ -1240,4 +1250,203 @@ fn all_failed_transitions_and_restore_io_retain_authoritative_recovery_for_later
         before
     );
     assert!(!txn.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn marker_creation_failure_leaves_ambiguity_until_explicit_local_rollback() {
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    f.source("session_index.jsonl", b"original");
+    f.ok(&["glurp", "--harness", "codex"]);
+    let before = fs::metadata(f.archive("session_index.jsonl"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    f.source("session_index.jsonl", b"changed!");
+    let log = f.home.join("fault.log");
+    let output = f
+        .process(&["glurp", "--harness", "codex"])
+        .env("LD_PRELOAD", f.fault_shim())
+        .env("GLURP_FAULT_MODE", "commit-no-marker")
+        .env("GLURP_FAULT_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let events = fs::read_to_string(log).unwrap();
+    for event in [
+        "commit-sync-failed",
+        "reverse-rename-failed",
+        "parent-rename-failed",
+    ] {
+        assert!(events.contains(event), "{events}");
+    }
+    assert_eq!(
+        events.matches("marker-create-failed").count(),
+        2,
+        "{events}"
+    );
+    let txn = f.home.join("data/glurp/hosts/lab/.transaction");
+    assert!(txn.join("committed").exists());
+    assert!(!txn.join(".rollback-required").exists());
+    // Fault-free retry must refuse before SSH and retain both generations.
+    let contacted = f.home.join("ssh-contacted");
+    f.fake_ssh(&format!("touch '{}'; exit 9", contacted.display()));
+    for _ in 0..2 {
+        let retry = f.command(&["glurp", "--harness", "codex"]);
+        assert!(!retry.status.success());
+        assert!(String::from_utf8_lossy(&retry.stderr).contains("recovery required"));
+        assert!(!contacted.exists());
+        assert_eq!(
+            fs::read(f.archive("session_index.jsonl")).unwrap(),
+            b"changed!"
+        );
+        assert_eq!(fs::read(txn.join("backups/0")).unwrap(), b"original");
+    }
+    assert!(!f.command(&["recover", "lab"]).status.success());
+    f.ok(&["recover", "lab", "--rollback"]);
+    assert!(!contacted.exists());
+    assert_eq!(
+        fs::read(f.archive("session_index.jsonl")).unwrap(),
+        b"original"
+    );
+    assert_eq!(
+        fs::metadata(f.archive("session_index.jsonl"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before
+    );
+    assert!(!txn.exists());
+    assert!(!f.command(&["glurp", "--harness", "codex"]).status.success());
+    assert!(contacted.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn successful_commit_partial_cleanup_requires_manual_resolution_without_partial_restore() {
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    for path in ["session_index.jsonl", "sessions/b.jsonl"] {
+        f.source(path, b"original");
+    }
+    f.ok(&["glurp", "--harness", "codex"]);
+    for path in ["session_index.jsonl", "sessions/b.jsonl"] {
+        f.source(path, b"changed!");
+    }
+    let log = f.home.join("fault.log");
+    let output = f
+        .process(&["glurp", "--harness", "codex"])
+        .env("LD_PRELOAD", f.fault_shim())
+        .env("GLURP_FAULT_MODE", "commit-partial-cleanup")
+        .env("GLURP_FAULT_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(log)
+            .unwrap()
+            .contains("partial-cleanup-failed")
+    );
+    let txn = f.home.join("data/glurp/hosts/lab/.transaction");
+    assert!(txn.join("committed").is_file());
+    assert!(!txn.join("backups/0").exists());
+    assert_eq!(fs::read(txn.join("backups/1")).unwrap(), b"original");
+    let contacted = f.home.join("ssh-contacted");
+    f.fake_ssh(&format!("touch '{}'; exit 9", contacted.display()));
+    assert!(!f.command(&["glurp", "--harness", "codex"]).status.success());
+    assert!(
+        !f.command(&["recover", "lab", "--rollback"])
+            .status
+            .success()
+    );
+    assert!(!contacted.exists());
+    for path in ["session_index.jsonl", "sessions/b.jsonl"] {
+        assert_eq!(fs::read(f.archive(path)).unwrap(), b"changed!");
+    }
+    assert!(txn.join("committed").is_file());
+    assert_eq!(fs::read(txn.join("backups/1")).unwrap(), b"original");
+    assert!(!txn.join(".rollback-required").exists());
+}
+
+#[test]
+fn explicit_rollback_checks_binding_lock_and_entire_journal_before_targets() {
+    use fs2::FileExt;
+    let f = Fixture::new();
+    f.ok(&["host", "add", "lab", "lab"]);
+    f.source("session_index.jsonl", b"changed!");
+    f.ok(&["glurp", "--harness", "codex"]);
+    let base = f.home.join("data/glurp/hosts/lab");
+    let txn = base.join(".transaction");
+    fs::create_dir(&txn).unwrap();
+    fs::create_dir(txn.join("backups")).unwrap();
+    fs::set_permissions(&txn, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(txn.join("backups"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(txn.join("backups/0"), b"original").unwrap();
+    let journal = txn.join("committed");
+    let valid = r#"{"harness":"codex","entries":[{"path":"session_index.jsonl","old":true}]}"#;
+    fs::write(&journal, valid).unwrap();
+    f.fake_ssh(&format!("touch '{}'", f.home.join("ssh-called").display()));
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(base.join("archive.lock"))
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+    assert!(
+        !f.command(&["recover", "lab", "--rollback"])
+            .status
+            .success()
+    );
+    FileExt::unlock(&lock).unwrap();
+    fs::write(base.join("destination.json"), "\"different\"").unwrap();
+    assert!(
+        !f.command(&["recover", "lab", "--rollback"])
+            .status
+            .success()
+    );
+    fs::write(base.join("destination.json"), "\"lab\"").unwrap();
+    for bad in [
+        r#"{"harness":"codex","entries":[{"path":"session_index.jsonl","old":true},{"path":"../escape","old":false}]}"#,
+        r#"{"harness":"codex","entries":[{"path":"session_index.jsonl","old":true},{"path":"session_index.jsonl","old":false}]}"#,
+        r#"{"harness":"other","entries":[]}"#,
+        "malformed journal",
+    ] {
+        fs::write(&journal, bad).unwrap();
+        assert!(
+            !f.command(&["recover", "lab", "--rollback"])
+                .status
+                .success()
+        );
+        assert_eq!(
+            fs::read(f.archive("session_index.jsonl")).unwrap(),
+            b"changed!"
+        );
+        assert_eq!(fs::read(txn.join("backups/0")).unwrap(), b"original");
+        assert!(!txn.join(".rollback-required").exists());
+    }
+    fs::write(&journal, valid).unwrap();
+    fs::rename(txn.join("backups/0"), txn.join("original")).unwrap();
+    std::os::unix::fs::symlink(txn.join("original"), txn.join("backups/0")).unwrap();
+    assert!(
+        !f.command(&["recover", "lab", "--rollback"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::read(f.archive("session_index.jsonl")).unwrap(),
+        b"changed!"
+    );
+    fs::remove_file(txn.join("backups/0")).unwrap();
+    fs::rename(txn.join("original"), txn.join("backups/0")).unwrap();
+    f.ok(&["recover", "lab", "--rollback"]);
+    assert_eq!(
+        fs::read(f.archive("session_index.jsonl")).unwrap(),
+        b"original"
+    );
+    assert!(!f.home.join("ssh-called").exists());
 }

@@ -1,6 +1,6 @@
 //! A host lock protects one durable transaction. Backups are complete and synced
-//! before ready.json becomes durable. Until committed exists, recovery rolls back
-//! every entry; it is safe to repeat recovery after a second interruption.
+//! before ready.json becomes durable. Restart-visible committed journals are
+//! ambiguous: only the live publisher knows whether the commit sync succeeded.
 use crate::{
     remote::Deadline,
     secure::{self, Dir},
@@ -114,13 +114,28 @@ fn valid_harness(harness: &str) -> bool {
 }
 
 pub fn recover(base: &Dir) -> Result<()> {
-    recover_inner(base, false)
+    recover_inner(base, Recovery::Automatic)
 }
 /// A failed publication must never be reinterpreted as successful commit cleanup.
 pub fn recover_failed(base: &Dir) -> Result<()> {
-    recover_inner(base, true)
+    recover_inner(base, Recovery::FailedPublication)
 }
-fn recover_inner(base: &Dir, failed: bool) -> Result<()> {
+pub fn rollback(base: &Dir) -> Result<()> {
+    recover_inner(base, Recovery::ExplicitRollback)
+}
+#[derive(Clone, Copy)]
+enum Recovery {
+    Automatic,
+    FailedPublication,
+    ExplicitRollback,
+}
+#[derive(Clone, Copy)]
+enum TransactionState {
+    Staging,
+    Rollback,
+    AmbiguousCommit,
+}
+fn recover_inner(base: &Dir, mode: Recovery) -> Result<()> {
     // .recovery records a failed decision transition whose reverse rename
     // could not be completed. Its journal is always interpreted as rollback.
     let recovery = match base.child(".recovery", false) {
@@ -129,6 +144,15 @@ fn recover_inner(base: &Dir, failed: bool) -> Result<()> {
         Err(error) => return Err(error),
     };
     let recovering = recovery.is_some();
+    if recovering {
+        match base.child(".transaction", false) {
+            Ok(_) => {
+                bail!("conflicting recovery directories; preserve evidence and resolve manually")
+            }
+            Err(error) if secure::not_found(&error) => (),
+            Err(error) => return Err(error),
+        }
+    }
     let transaction_name = if recovering {
         ".recovery"
     } else {
@@ -143,26 +167,21 @@ fn recover_inner(base: &Dir, failed: bool) -> Result<()> {
         Err(error) => return Err(error),
     };
     let marked_failed = txn.optional_file(".rollback-required")?.is_some();
-    let rollback = failed || recovering || marked_failed;
-    if !rollback
-        && txn.optional_file("committed")?.is_some()
-        && txn.optional_file("ready.json")?.is_none()
-    {
-        base.remove_tree(transaction_name)?;
-        return Ok(());
-    }
-    if failed && !marked_failed && txn.optional_file("committed")?.is_some() {
-        // Record failed-publication intent before touching a single restore
-        // target. This is independent of both journal and parent renames.
-        // Even a subsequent sync failure leaves the visible marker conservative.
-        txn.create_new(".rollback-required")?.sync_all()?;
-        txn.sync()?;
-    }
-    let journal_name = if rollback && txn.optional_file("ready.json")?.is_none() {
-        "committed"
+    let ready = txn.optional_file("ready.json")?.is_some();
+    let committed = txn.optional_file("committed")?.is_some();
+    let state = if ready || (committed && (recovering || marked_failed)) {
+        TransactionState::Rollback
+    } else if committed {
+        TransactionState::AmbiguousCommit
     } else {
-        "ready.json"
+        TransactionState::Staging
     };
+    if matches!(state, TransactionState::AmbiguousCommit) && matches!(mode, Recovery::Automatic) {
+        bail!(
+            "ambiguous recovery decision; backups retained; use glurp recover HOST --rollback or preserve evidence for manual resolution"
+        );
+    }
+    let journal_name = if ready { "ready.json" } else { "committed" };
     if let Some(file) = txn.optional_file(journal_name)? {
         // The journal is locally generated, but must not accept arbitrary paths
         // or unbounded data if another process damaged the transaction.
@@ -183,8 +202,16 @@ fn recover_inner(base: &Dir, failed: bool) -> Result<()> {
             let (parent, leaf) = archive.parent(&entry.path, false)?;
             parent.optional_file(&leaf)?;
             if entry.old {
-                backups.file(&index.to_string(), false)?;
+                backups.file(&index.to_string(), false).context(
+                    "recovery backup unavailable; preserve evidence and resolve manually",
+                )?;
             }
+        }
+        if matches!(state, TransactionState::AmbiguousCommit) {
+            // Persist rollback authority only after the complete preflight. A
+            // failed marker creation leaves ambiguity, never cleanup permission.
+            txn.create_new(".rollback-required")?.sync_all()?;
+            txn.sync()?;
         }
         // Copy the backup to a durable temporary and rename it over the target.
         // Keep backups until *all* rollback work succeeds, permitting retries.
@@ -316,8 +343,8 @@ fn publish_with(
         }
         return Err(error);
     }
-    // A durable commit is authoritative. Cleanup failure leaves a committed
-    // journal for the next run, and is not reported as a failed publication.
+    // Only this live publisher observed successful commit-directory sync.
+    // Cleanup failure leaves ambiguity on restart, never cleanup authority.
     let _ = base.remove_tree(".transaction");
     Ok(())
 }
@@ -484,6 +511,13 @@ mod tests {
         artifacts.rename("a", &archive, "a").unwrap();
         txn.rename_unsynced("ready.json", &txn, "committed")
             .unwrap();
+        // An interrupted commit decision alone conveys no cleanup authority.
+        assert!(recover(&base).is_err());
+        assert_eq!(read(&base, "a"), b"new-a");
+        assert_eq!(
+            backups.file("0", false).unwrap().metadata().unwrap().len(),
+            5
+        );
         // Model an interrupted reverse transition in its conservative parent
         // name. The complete journal is still usable without rewriting it.
         base.rename(".transaction", &base, ".recovery").unwrap();

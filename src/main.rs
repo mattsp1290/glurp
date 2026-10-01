@@ -23,6 +23,13 @@ enum Commands {
         #[command(subcommand)]
         command: HostCommand,
     },
+    /// Restore retained originals locally; may discard a successful newest generation
+    Recover {
+        host: String,
+        /// Explicitly authorize rollback of an ambiguous transaction; never contacts SSH
+        #[arg(long, required = true)]
+        rollback: bool,
+    },
     /// Collect remote chat archives (Claude Code, Codex, pi, OpenCode)
     Glurp {
         /// Host names; omit to collect all configured hosts
@@ -126,6 +133,12 @@ fn run() -> Result<()> {
                 println!("host removed; archives retained");
             }
         },
+        Commands::Recover { host, rollback: _ } => {
+            let selected = store.select(&[host])?;
+            drop(store);
+            archive::rollback(&paths.data, &selected[0])?;
+            println!("local rollback complete; originals restored");
+        }
         Commands::Glurp {
             hosts,
             harness,
