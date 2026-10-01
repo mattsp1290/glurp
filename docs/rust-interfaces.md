@@ -1,8 +1,8 @@
 # Rust archive interfaces
 
-The Rust binary collects Claude Code, Codex, pi, and OpenCode. The existing Go
-implementation is historical behavior evidence and is never invoked by Rust.
-Build-system cutover remains a subsequent milestone slice.
+The Rust binary collects Claude Code, Codex, pi, and OpenCode. Production code,
+builds, and CI use Rust and OpenSSH. Historical plans under `.agents/plans/`
+are provenance only; they do not describe the current CLI or build contract.
 
 Configuration is a JSON array of host objects (`name`, `destination`, and optional `claude_paths`,
 `codex_paths`, `pi_paths` arrays) at

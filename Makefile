@@ -1,17 +1,19 @@
-GO_FILES := $(shell find cmd internal -name '*.go' -type f | LC_ALL=C sort)
-
-.PHONY: build test vet fmt-check check
+.PHONY: build test lint fmt-check check
 
 build:
-	go build ./cmd/glurp
+	cargo build --release --locked
 
 test:
-	go test -race ./...
+	cargo test --all-targets --locked
 
-vet:
-	go vet ./...
+lint:
+	cargo clippy --all-targets --locked -- -D warnings
 
 fmt-check:
-	@test -z "$$(gofmt -l $(GO_FILES))" || { gofmt -l $(GO_FILES); exit 1; }
+	cargo fmt --all -- --check
 
-check: fmt-check test vet build
+check:
+	cargo fmt --all -- --check
+	cargo clippy --all-targets --locked -- -D warnings
+	cargo test --all-targets --locked
+	cargo build --release --locked

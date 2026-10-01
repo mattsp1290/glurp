@@ -9,7 +9,7 @@ Glurp preserves native bytes and deliberately avoids depending on transcript-mes
 | OpenCode | Global `SELECT id FROM session ORDER BY id` inventory through `opencode db`, then `opencode export <id>` | [OpenCode CLI documentation](https://opencode.ai/docs/cli/) and [OpenCode repository](https://github.com/anomalyco/opencode) | Fake inventory includes root and child IDs; all exports validated before publication. No personal database queried. |
 | pi | `$PI_CODING_AGENT_SESSION_DIR`, `$PI_CODING_AGENT_DIR/sessions`, or `$HOME/.pi/agent/sessions` JSONL | [pi-mono repository](https://github.com/badlogic/pi-mono) | Synthetic nested JSONL and both environment overrides exercised by POSIX sh fixture. |
 
-The final Rust CI slice must run all unit and end-to-end fake-SSH fixtures on Linux and macOS, including the embedded POSIX sh scripts. Before tagging a release, record the exact upstream commits or versions exercised, run a disposable real SSH server containing all four synthetic source surfaces twice, and confirm byte hashes plus unchanged modification times on the second run.
+The Rust CI matrix runs all-target unit and end-to-end fake-SSH fixtures on Linux and macOS, including the embedded POSIX sh scripts. Linux-only preload fault injection additionally requires a C compiler. Before tagging a release, record the exact upstream commits or versions exercised, run a disposable real SSH server containing all four synthetic source surfaces twice, and confirm byte hashes plus unchanged modification times on the second run.
 
 Rust does not run harness version probes. Executable presence only informs absent-data discovery; it must not be presented as version certification. OpenCode schema or export incompatibility is a hard failure because a partial inventory would be misleading.
 
@@ -45,8 +45,9 @@ PATH, fake OpenCode, and fake SSH that executes the embedded POSIX sh scripts.
 They exercise nested Claude subagents, Codex raw/compressed/index artifacts,
 nested pi, all environment overrides, repeated literal roots, remote symlinks,
 absent and required sources, and root/child OpenCode exports and failure batches.
-No installed harness or personal database is queried. Current tests establish
-Linux fixture compatibility; live macOS CI and disposable real SSH verification
-remain later milestone gates. Transaction-wide rollback, configurable bounds,
-cancellation and descriptor-relative traversal remain obligations of the safety
-slice documented in rust-interfaces.md.
+No installed harness or personal database is queried. Local test evidence establishes Linux fixture compatibility. The CI matrix is
+configured for both platforms; an actual macOS CI run and disposable real SSH
+verification must be recorded separately before claiming final acceptance.
+Transaction-wide rollback, configurable bounds, cancellation, descriptor-relative
+traversal, and explicit local recovery are implemented and documented in
+[rust-safety.md](rust-safety.md).
