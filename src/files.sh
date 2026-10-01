@@ -7,7 +7,9 @@ for root do
     index=$((index + 1))
     case "$root" in '~/'*) root=$HOME/${root#\~/};; esac
     case "$root" in /*) ;; *) exit 2;; esac
-    root=${root%/}; [ -n "$root" ] || root=/
+    while [ "$root" != / ]; do
+        case "$root" in */) root=${root%/};; *) break;; esac
+    done
     check=$root
     while :; do
         [ ! -L "$check" ] || exit 2
@@ -26,7 +28,8 @@ for root do
     find "$root" -type f -exec sh -c '
         root=$1; prefix=$2; harness=$3; shift 3
         for file do
-            rel=${file#"$root"/}
+            rel=${file#"$root"}
+            rel=${rel#/}
             case "$harness:$rel" in
                 codex:sessions/*.jsonl|codex:sessions/*.jsonl.zst|codex:archived_sessions/*.jsonl|codex:archived_sessions/*.jsonl.zst|codex:session_index.jsonl|claude:projects/*.jsonl|pi:*.jsonl) ;;
                 *) continue;;

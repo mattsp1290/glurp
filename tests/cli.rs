@@ -488,3 +488,111 @@ fn repeated_absolute_codex_roots_override_automatic_discovery() {
     );
     assert!(!f.archive("session_index.jsonl").exists());
 }
+
+#[test]
+fn trailing_root_separators_preserve_explicit_and_automatic_artifacts() {
+    for suffix in ["/", "//", "////"] {
+        for explicit in [false, true] {
+            let f = Fixture::new();
+            f.write_remote(
+                "claude source/projects/p/subagents/session.jsonl",
+                b"claude bytes",
+            );
+            f.write_remote("codex source/sessions/p/session.jsonl.zst", b"codex bytes");
+            f.write_remote("pi source/p/deep/session.jsonl", b"pi bytes");
+            if explicit {
+                f.ok(&[
+                    "host",
+                    "add",
+                    "lab",
+                    "lab",
+                    "--claude-path",
+                    &format!("~/claude source{suffix}"),
+                    "--codex-path",
+                    &format!("~/codex source{suffix}"),
+                    "--pi-path",
+                    &format!("~/pi source{suffix}"),
+                ]);
+            } else {
+                f.ok(&["host", "add", "lab", "lab"]);
+                let ssh = f.bin.join("ssh");
+                let script = fs::read_to_string(&ssh).unwrap().replace("exec /bin/sh -s", &format!("export CLAUDE_CONFIG_DIR=\"$HOME/claude source{suffix}\"\nexport CODEX_HOME=\"$HOME/codex source{suffix}\"\nexport PI_CODING_AGENT_SESSION_DIR=\"$HOME/pi source{suffix}\"\nexec /bin/sh -s"));
+                fs::write(ssh, script).unwrap();
+            }
+            f.ok(&[
+                "glurp",
+                "--harness",
+                "claude",
+                "--harness",
+                "codex",
+                "--harness",
+                "pi",
+            ]);
+            let prefix = if explicit { "root-0001/" } else { "" };
+            let base = f.home.join("data/glurp/hosts/lab");
+            for (harness, path, bytes) in [
+                (
+                    "claude",
+                    "projects/p/subagents/session.jsonl",
+                    b"claude bytes".as_slice(),
+                ),
+                (
+                    "codex",
+                    "sessions/p/session.jsonl.zst",
+                    b"codex bytes".as_slice(),
+                ),
+                ("pi", "p/deep/session.jsonl", b"pi bytes".as_slice()),
+            ] {
+                assert_eq!(
+                    fs::read(base.join(harness).join(format!("{prefix}{path}"))).unwrap(),
+                    bytes
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn slash_only_root_uses_relative_paths_with_controlled_find() {
+    for root in ["/", "//", "////"] {
+        let f = Fixture::new();
+        f.write_remote("isolated.jsonl", b"isolated pi bytes");
+        // Never traverse /. The fake find executes only the real collector's
+        // embedded callback with one explicitly selected synthetic fixture.
+        let find = f.bin.join("find");
+        fs::remove_file(&find).unwrap();
+        fs::write(
+            &find,
+            r#"#!/bin/sh
+[ "$1" = / ] && [ "$2" = -type ] && [ "$3" = f ] && [ "$4" = -exec ] || exit 90
+shift 4
+shell=$1; shift
+[ "$1" = -c ] || exit 91
+shift
+callback=$1; shift
+[ "$1" = sh ] || exit 92
+shift
+exec "$shell" -c "$callback" sh "$1" "$2" "$3" "$HOME/isolated.jsonl"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(find, fs::Permissions::from_mode(0o700)).unwrap();
+        f.ok(&["host", "add", "lab", "lab", "--pi-path", root]);
+        f.ok(&["glurp", "--harness", "pi"]);
+        let relative = f
+            .remote
+            .join("isolated.jsonl")
+            .strip_prefix("/")
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            fs::read(
+                f.home
+                    .join("data/glurp/hosts/lab/pi/root-0001")
+                    .join(relative)
+            )
+            .unwrap(),
+            b"isolated pi bytes"
+        );
+    }
+}
