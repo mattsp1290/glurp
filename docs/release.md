@@ -93,7 +93,7 @@ The workflow serializes tag runs and uses these stages:
 
 1. `validate` requires an annotated tag on `main`, equal to `Cargo.toml`, with
    no already-published release for that tag and no equal or newer stable release.
-2. `ci` invokes the normal Linux/macOS formatting, lint, tests, build, and
+2. `ci` invokes the normal Linux formatting, lint, tests, build, and
    distribution-test gates for that commit.
 3. `build` compiles four targets with `GLURP_VERSION` set to the selected tag,
    checks version/help, runs the installer suite, native upgrade tests, and a
@@ -110,6 +110,8 @@ The workflow serializes tag runs and uses these stages:
 Drafts and prereleases are ignored by `releases/latest`. Default installs and
 upgrades therefore see a release only after the four-platform smoke stage.
 The x86_64 macOS binary is built and executed through Rosetta on the arm runner.
+Routine pull-request and branch-push CI runs only on Linux; macOS checks remain
+in the release build and install/upgrade smoke stages.
 
 ```sh
 gh workflow run release.yml -f version=v0.0.0

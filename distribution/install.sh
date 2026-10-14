@@ -132,8 +132,9 @@ main() {
   digest=$(field sha256 "$target")
   [ -n "$url" ] || fail "target $target not found in manifest"
   [ "$url" = "$base/download/v$version/glurp-$target" ] || fail "unexpected asset URL for $target"
+  # Ranges such as a-f can also match uppercase letters in some locales.
   case $digest in
-    '' | *[!0-9a-f]*) fail "invalid sha256 for $target" ;;
+    '' | *[!0123456789abcdef]*) fail "invalid sha256 for $target" ;;
   esac
   [ "${#digest}" -eq 64 ] || fail "invalid sha256 for $target"
 

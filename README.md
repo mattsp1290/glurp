@@ -62,13 +62,15 @@ make install
 make check
 ```
 
-Use `target/release/glurp` directly or place it on your `PATH`. Linux and macOS CI
-run the same gates, including synthetic fixtures that execute the actual POSIX
+Use `target/release/glurp` directly or place it on your `PATH`. Linux CI
+runs the same gates, including synthetic fixtures that execute the actual POSIX
 collector scripts. `make build` and `make install` derive the reported version
 from Git; `VERSION=vX.Y.Z` overrides it. Direct Cargo builds accept
 `GLURP_VERSION=vX.Y.Z` and use the same Git fallback. Outside Git they report
 `dev`. An approved annotated version tag publishes the four release binaries,
 manifest, and installer; see [releasing Glurp](docs/release.md).
+macOS remains a supported release target; its build and installation checks run
+in the release workflow rather than on every pull request or branch push.
 
 ## Configure hosts
 

@@ -253,15 +253,41 @@ class InstallerTests(TempCase):
 
     def test_invalid_digest(self):
         for bad in ("", "0" * 63, "0" * 65, "G" * 64, "A" * 64):
-            m = self.release("v9.9.9", latest=True)
-            with open(m) as f:
-                digest = json.load(f)["sha256"][self.target]
-            self.edit(m, lambda text: text.replace(digest, bad))
-            self.put_existing()
-            r = self.install()
-            self.assertNotEqual(r.returncode, 0, repr(bad))
-            self.assertIn("invalid sha256", r.stderr)
-            self.assert_untouched()
+            with self.subTest(digest=bad):
+                m = self.release("v9.9.9", latest=True)
+                with open(m) as f:
+                    digest = json.load(f)["sha256"][self.target]
+                self.edit(m, lambda text: text.replace(digest, bad))
+                self.put_existing()
+                r = self.install()
+                self.assertNotEqual(r.returncode, 0, repr(bad))
+                self.assertIn("invalid sha256", r.stderr)
+                self.assert_untouched()
+
+    def test_invalid_digest_with_locale_collation(self):
+        bash = shutil.which("bash")
+        locale = shutil.which("locale")
+        if not bash or not locale:
+            self.skipTest("bash and locale are required for collation regression")
+        locales = subprocess.run([locale, "-a"], capture_output=True, text=True, check=True)
+        selected = next((name for name in locales.stdout.splitlines()
+                         if name.lower().replace("-", "") == "en_us.utf8"), None)
+        if selected is None:
+            self.skipTest("en_US UTF-8 locale is not installed")
+        m = self.release("v9.9.9", latest=True)
+        with open(m) as f:
+            digest = json.load(f)["sha256"][self.target]
+        self.edit(m, lambda text: text.replace(digest, "A" * 64))
+        self.put_existing()
+        # Old Bash (including macOS /bin/sh) collates ranges by locale.
+        # Disable the newer ASCII-range default where the option exists.
+        script = 'shopt -u globasciiranges 2>/dev/null || true\n. "$1"'
+        r = subprocess.run([bash, "-c", script, "installer-locale-test", INSTALL],
+                           env=self.env(GLURP_INSTALL_DIR=self.dest, LC_ALL=selected),
+                           capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("invalid sha256", r.stderr)
+        self.assert_untouched()
 
     def test_inconsistent_tag(self):
         m = self.release("v9.9.9", latest=True)
