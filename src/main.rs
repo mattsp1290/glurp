@@ -5,12 +5,13 @@ mod limits;
 mod remote;
 mod secure;
 mod transaction;
+mod upgrade;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(version, about = "Collect private raw chat archives over OpenSSH")]
+#[command(version = env!("GLURP_VERSION"), about = "Collect private raw chat archives over OpenSSH")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -18,6 +19,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Replace this binary with a verified GitHub release
+    Upgrade {
+        /// Report the available release without replacing the binary
+        #[arg(long)]
+        check: bool,
+        /// Replace even a development, Cargo-installed, or current build
+        #[arg(long)]
+        force: bool,
+        /// Install a specific vX.Y.Z release (also supports rollback)
+        #[arg(long = "version", value_name = "TAG")]
+        tag: Option<String>,
+        /// Print the upgrade result as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage SSH destinations
     Host {
         #[command(subcommand)]
@@ -96,10 +112,21 @@ fn failure_reason(error: &anyhow::Error) -> &'static str {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // An upgrade must not open configuration, acquire archive locks or contact SSH.
+    if let Commands::Upgrade {
+        check,
+        force,
+        tag,
+        json,
+    } = &cli.command
+    {
+        return upgrade::execute(*check, *force, tag.as_deref(), *json);
+    }
     remote::install_cancellation()?;
     let paths = config::Paths::resolve()?;
     let mut store = config::Store::open(&paths.config)?;
     match cli.command {
+        Commands::Upgrade { .. } => unreachable!("upgrade is handled before opening storage"),
         Commands::Host { command } => match command {
             HostCommand::Add {
                 name,
