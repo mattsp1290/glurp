@@ -2,26 +2,73 @@
 
 `glurp` is a Linux/macOS CLI that privately collects AI coding-chat archives from remote machines over OpenSSH. It collects Claude Code, Codex, OpenCode, and pi histories without parsing or normalizing transcript content.
 
-## Build
+## Install and upgrade
 
-Build on Linux or macOS with stable Rust with edition 2024 support,
-Cargo, rustfmt, and clippy. The tested local toolchain is Rust 1.97.0. Building
+```sh
+curl -fsSL https://github.com/mattsp1290/glurp/releases/latest/download/install.sh | sh
+```
+
+The installer downloads a prebuilt binary for Linux or macOS on x86_64 or
+aarch64, verifies its SHA-256 against the release manifest, and installs it into
+`$HOME/.local/bin`. It needs `curl`, `awk`, and one of `sha256sum`, `shasum`, or
+`openssl`. It never uses `sudo` or edits shell profiles. Linux binaries are
+static musl builds; Windows is not supported. The command becomes available
+once the first release has been published through the [release workflow](docs/release.md).
+
+Set `GLURP_INSTALL_DIR` to choose another directory or
+`GLURP_INSTALL_VERSION=vX.Y.Z` to install a specific release.
+
+```sh
+glurp upgrade                         # install the latest release in place
+glurp upgrade --check                 # report only
+glurp upgrade --check --json          # machine-readable result
+glurp upgrade --version vX.Y.Z         # pin a release or roll back
+```
+
+Upgrades validate the release manifest, checksum, and downloaded binary's
+`--version` output before atomically replacing the current executable. They
+never open host configuration, archives, or SSH connections. Existing collection
+processes continue using their old executable; new invocations use the update.
+Cargo-installed and build-tree binaries are refused unless `--force` is given;
+normally rebuild those from source. Development builds without a comparable
+release version also require `--force` or an explicit `--version`.
+
+`--check` never replaces the binary and exits successfully when an update is
+available. JSON reports `current`, `latest`, `target`, `path`,
+`update_available`, and `upgraded`; operational errors exit nonzero. The
+installer and updater use GitHub Releases by default. `GLURP_RELEASE_BASE_URL`
+can select an HTTPS mirror with the same manifest layout, or a `file://` release
+tree for offline tests. Checksums detect corruption, not a compromised release
+origin. See [the release contract](docs/release.md).
+
+To uninstall, remove `~/.local/bin/glurp` (or the binary in your chosen install
+directory). Host configuration and collected archives remain in place.
+
+## Build from source
+
+Build on Linux or macOS with the Rust toolchain pinned in `rust-toolchain.toml`
+(1.98.1), Cargo, rustfmt, and clippy. Building
 requires Cargo dependency access and a native linker/toolchain (on macOS, Xcode
 Command Line Tools). Running requires OpenSSH locally and POSIX `sh` plus standard
 Unix utilities on the remote. Linux tests also use a C compiler for test-only
 filesystem fault injection.
 
 ```sh
-cargo build --release --locked
+make build
 ./target/release/glurp --help
-# Run formatting, Clippy, all-target tests, and the release build:
+# Install into Cargo's configured bin directory:
+make install
+# Run formatting, Clippy, all-target tests, release build, and installer tests:
 make check
 ```
 
 Use `target/release/glurp` directly or place it on your `PATH`. Linux and macOS CI
-run the same four Rust gates, including synthetic fixtures that execute the actual
-POSIX collector scripts. Release packaging and publication are outside this
-cutover; this repository does not configure a release publisher.
+run the same gates, including synthetic fixtures that execute the actual POSIX
+collector scripts. `make build` and `make install` derive the reported version
+from Git; `VERSION=vX.Y.Z` overrides it. Direct Cargo builds accept
+`GLURP_VERSION=vX.Y.Z` and use the same Git fallback. Outside Git they report
+`dev`. An approved annotated version tag publishes the four release binaries,
+manifest, and installer; see [releasing Glurp](docs/release.md).
 
 ## Configure hosts
 

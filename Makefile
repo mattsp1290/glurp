@@ -1,7 +1,14 @@
-.PHONY: build test lint fmt-check check
+.PHONY: build release-build install test lint fmt-check distribution-test check ci
+
+VERSION ?= $(shell git describe --tags --match 'v*' --always --dirty 2>/dev/null || echo dev)
 
 build:
-	cargo build --release --locked
+	GLURP_VERSION="$(VERSION)" cargo build --release --locked
+
+release-build: build
+
+install:
+	GLURP_VERSION="$(VERSION)" cargo install --locked --path .
 
 test:
 	cargo test --all-targets --locked
@@ -12,8 +19,9 @@ lint:
 fmt-check:
 	cargo fmt --all -- --check
 
-check:
-	cargo fmt --all -- --check
-	cargo clippy --all-targets --locked -- -D warnings
-	cargo test --all-targets --locked
-	cargo build --release --locked
+distribution-test:
+	python3 -S distribution/tests/run_tests.py
+
+check: fmt-check lint test build distribution-test
+
+ci: check

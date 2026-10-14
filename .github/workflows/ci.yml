@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
+    # Tag builds are gated by the reusable CI job in release.yml.
+    branches:
+      - "**"
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -13,13 +17,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: actions/checkout@v7
+      - name: Install the pinned compiler and checks
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc --version | grep -F "rustc $channel "
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -28,3 +35,5 @@ jobs:
         run: cargo test --all-targets --locked
       - name: Release build
         run: cargo build --release --locked
+      - name: Test the release manifest and installer
+        run: python3 -S distribution/tests/run_tests.py

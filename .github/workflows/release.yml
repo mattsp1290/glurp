@@ -1,0 +1,311 @@
+name: release
+
+# A pushed annotated vX.Y.Z tag publishes a release. A manual dispatch is a dry
+# run: it builds and packages every asset and publishes nothing.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Dry-run version, vX.Y.Z (use v0.0.0)
+        required: true
+        type: string
+        default: v0.0.0
+
+permissions:
+  contents: read
+
+# Tag runs share one group so two releases never validate and promote
+# concurrently; dry runs only queue behind themselves.
+concurrency:
+  group: ${{ github.event_name == 'push' && 'release' || format('release-dry-{0}', github.ref) }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The release tag, or the dry-run input. build.rs embeds it: Actions
+  # checkouts carry no tags for `git describe`.
+  GLURP_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+  # jq filter over `gh release list` output: true when no other published,
+  # non-prerelease vX.Y.Z release is greater than or equal to $tag.
+  NO_NEWER_RELEASE: >-
+    def triple: ltrimstr("v") | split(".") | map(tonumber);
+    all(
+      .[] | select((.isDraft or .isPrerelease) | not) | .tagName
+        | select(. != $tag and test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"));
+      triple < ($tag | triple)
+    )
+
+# A skipped job skips its dependents by default, and `validate` is skipped on
+# dry runs, so every later job states its condition.
+jobs:
+  validate:
+    name: Validate the release tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Require an annotated tag on main that matches Cargo.toml
+        run: |
+          [[ "$GLURP_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          # The checkout can leave the tag pointing at the commit.
+          git fetch --force origin "+refs/heads/main:refs/remotes/origin/main" "+refs/tags/$GLURP_VERSION:refs/tags/$GLURP_VERSION"
+          kind=$(git cat-file -t "refs/tags/$GLURP_VERSION")
+          if [ "$kind" != tag ]; then
+            echo "::error::$GLURP_VERSION is a lightweight tag; create it with git tag -a"
+            exit 1
+          fi
+          cargo_version=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ "v$cargo_version" != "$GLURP_VERSION" ]; then
+            echo "::error::Cargo.toml version $cargo_version does not match $GLURP_VERSION"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GLURP_VERSION^{commit}" origin/main; then
+            echo "::error::$GLURP_VERSION is not on main"
+            exit 1
+          fi
+      - name: Require a new, highest version
+        run: |
+          releases=$(gh release list --limit 1000 --json tagName,isDraft,isPrerelease)
+          if ! jq -e --arg tag "$GLURP_VERSION" 'all(.[] | select(.isDraft | not); .tagName != $tag)' <<<"$releases" >/dev/null; then
+            echo "::error::a published release for $GLURP_VERSION already exists"
+            exit 1
+          fi
+          # Keeps `latest` correct: no release may sort at or above this one.
+          if ! jq -e --arg tag "$GLURP_VERSION" "$NO_NEWER_RELEASE" <<<"$releases" >/dev/null; then
+            echo "::error::$GLURP_VERSION is not greater than every published release"
+            exit 1
+          fi
+
+  ci:
+    name: CI
+    needs: validate
+    if: ${{ !cancelled() && needs.validate.result != 'failure' }}
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: ci
+    if: ${{ !cancelled() && needs.ci.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: glurp-linux-x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - asset: glurp-linux-aarch64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - asset: glurp-macos-aarch64
+            target: aarch64-apple-darwin
+            runner: macos-15
+          # Built and executed on the arm64 runner through Rosetta 2.
+          - asset: glurp-macos-x86_64
+            target: x86_64-apple-darwin
+            runner: macos-15
+            exec: arch -x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      ASSET: ${{ matrix.asset }}
+      TARGET: ${{ matrix.target }}
+      EXEC: ${{ matrix.exec }}
+      BIN: target/${{ matrix.target }}/release/glurp
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require a vX.Y.Z version
+        run: |
+          [[ "$GLURP_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+      - name: Install the pinned compiler
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --target "$TARGET"
+          rustc --version | grep -F "rustc $channel "
+      - name: Install the musl toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build the release binary
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Require the embedded version
+        run: |
+          reported=$($EXEC "$BIN" --version)
+          echo "$reported"
+          [ "$reported" = "glurp $GLURP_VERSION" ]
+      - name: Smoke the CLI without a configured host
+        run: $EXEC "$BIN" --help
+      # The full collector and filesystem fault-injection suite runs in CI.
+      # LD_PRELOAD fault shims cannot interpose into the static musl binaries.
+      - name: Run unit and upgrade flow tests for the release target
+        run: cargo test --release --locked --target "$TARGET" --bin glurp --test upgrade
+      - name: Smoke all four collectors with the release binary
+        run: cargo test --release --locked --target "$TARGET" --test cli all_four_collectors_preserve_native_nested_bytes -- --exact
+      # A dry run exercises platform sh, awk, mktemp and checksum tools before
+      # any prerelease is public. The smoke job checks Rosetta installation.
+      - name: Run the installer tests on this platform
+        run: python3 -S distribution/tests/run_tests.py
+      - name: Name the asset
+        run: cp -f "$BIN" "$ASSET"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  package:
+    name: Package the release assets
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download the four binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: glurp-*
+          path: release
+          merge-multiple: true
+      - name: Write the manifest and add the installer
+        run: |
+          python3 -S distribution/manifest.py --tag "$GLURP_VERSION" \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases" \
+            --dir release --output release/glurp-manifest.json
+          cp -f distribution/install.sh release/install.sh
+          ls -l release
+          cat release/glurp-manifest.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: release
+          if-no-files-found: error
+
+  publish:
+    name: Publish the prerelease
+    needs: package
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.package.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ASSETS: glurp-linux-aarch64 glurp-linux-x86_64 glurp-macos-aarch64 glurp-macos-x86_64 glurp-manifest.json install.sh
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: release
+      - name: Replace a draft left by an earlier attempt
+        run: |
+          if [ "$(gh release view "$GLURP_VERSION" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "$GLURP_VERSION" --yes
+          fi
+      - name: Create the draft and attach every asset
+        working-directory: release
+        run: |
+          gh release create "$GLURP_VERSION" --draft --prerelease --verify-tag --title "$GLURP_VERSION" --generate-notes
+          # shellcheck disable=SC2086 # ASSETS is a list of file names
+          gh release upload "$GLURP_VERSION" $ASSETS
+          attached=$(gh release view "$GLURP_VERSION" --json assets --jq '[.assets[].name] | sort | join(" ")')
+          if [ "$attached" != "$ASSETS" ]; then
+            echo "::error::release holds '$attached', expected '$ASSETS'"
+            exit 1
+          fi
+      # Public, but a prerelease: releases/latest keeps the previous release
+      # until the smoke job has installed this one on every platform.
+      - name: Publish as a prerelease
+        run: gh release edit "$GLURP_VERSION" --draft=false --prerelease --latest=false
+
+  smoke:
+    name: Smoke ${{ matrix.name }}
+    needs: publish
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.publish.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - name: macos-aarch64
+            runner: macos-15
+          # `arch` makes `uname -m` report x86_64 to the installer.
+          - name: macos-x86_64
+            runner: macos-15
+            exec: arch -x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      EXEC: ${{ matrix.exec }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned prerelease over HTTPS
+        run: |
+          GLURP="$RUNNER_TEMP/pinned/glurp"
+          echo "GLURP=$GLURP" >>"$GITHUB_ENV"
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$GLURP_VERSION/install.sh" |
+            GLURP_INSTALL_VERSION="$GLURP_VERSION" GLURP_INSTALL_DIR="$RUNNER_TEMP/pinned" $EXEC sh
+          [ "$($EXEC "$GLURP" --version)" = "glurp $GLURP_VERSION" ]
+      - name: Upgrade the installed binary in place
+        run: |
+          $EXEC "$GLURP" upgrade --version "$GLURP_VERSION" --force
+          [ "$($EXEC "$GLURP" --version)" = "glurp $GLURP_VERSION" ]
+      - name: Smoke the installed CLI
+        run: $EXEC "$GLURP" --help
+
+  promote:
+    name: Promote to latest
+    needs: smoke
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.smoke.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # A re-run of a superseded tag must not move `latest` backwards.
+      - name: Require that no newer release was published meanwhile
+        run: |
+          releases=$(gh release list --limit 1000 --json tagName,isDraft,isPrerelease)
+          if ! jq -e --arg tag "$GLURP_VERSION" "$NO_NEWER_RELEASE" <<<"$releases" >/dev/null; then
+            echo "::error::a release at or above $GLURP_VERSION is already published"
+            exit 1
+          fi
+      - name: Mark the release as latest
+        run: gh release edit "$GLURP_VERSION" --prerelease=false --latest
+      - name: Install through the documented latest URL
+        run: |
+          GLURP="$RUNNER_TEMP/latest/glurp"
+          latest() {
+            curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh" |
+              GLURP_INSTALL_DIR="$RUNNER_TEMP/latest" sh &&
+              [ "$("$GLURP" --version)" = "glurp $GLURP_VERSION" ] &&
+              "$GLURP" upgrade --check --json |
+              jq -e --arg tag "$GLURP_VERSION" '.latest == $tag and .update_available == false'
+          }
+          # The latest redirect can lag the edit.
+          for attempt in $(seq 1 12); do
+            if latest; then
+              exit 0
+            fi
+            echo "attempt $attempt: releases/latest does not serve $GLURP_VERSION yet"
+            sleep 10
+          done
+          echo "::error::releases/latest never served $GLURP_VERSION"
+          exit 1
