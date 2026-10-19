@@ -83,13 +83,11 @@ remote `opencode`. Host registration and explicit recovery remain CLI commands.
 There is no HTTP server, scheduler, or Agentcraft integration. Publishing to
 crates.io is deferred; use an exact Git revision.
 
-The implementation revision below must be verified before adoption.
-`VERIFIED_COLLECTION_REV` is a placeholder, not a usable revision or a claim
-that an earlier binary-only commit exports this API.
+Pin the collection implementation to an exact revision:
 
 ```toml
 [dependencies]
-glurp = { git = "https://github.com/mattsp1290/glurp.git", rev = "VERIFIED_COLLECTION_REV" }
+glurp = { git = "https://github.com/mattsp1290/glurp.git", rev = "c20b4f34f66b574464792d2cf67eeedc2e70f21d" }
 tokio = { version = "1", features = ["rt", "macros", "signal"] }
 ```
 
@@ -194,7 +192,7 @@ make git-consumer-test
 # After an authorized push, test the exact remote implementation commit:
 python3 -S distribution/tests/check_git_consumer.py \
   --repository https://github.com/mattsp1290/glurp.git \
-  --revision VERIFIED_COLLECTION_REV
+  --revision c20b4f34f66b574464792d2cf67eeedc2e70f21d
 ```
 
 The verification script builds and runs a temporary standalone Git-pinned
