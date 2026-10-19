@@ -1,5 +1,6 @@
 //! Fully validate successful bounded streams before transaction publication.
 use crate::{
+    collection::Harness,
     collectors,
     config::Host,
     error::{CoreError, TaskErrorKind, with_kind},
@@ -156,11 +157,10 @@ pub(crate) enum ArchiveOutcome {
 
 /// Own the safe directory anchor and authoritative filesystem lease for a whole
 /// selected host batch, including recovery and postcommit cleanup.
-pub(crate) struct HostSession {
+pub(crate) struct HostSession<'host> {
     _lock: secure::ExclusiveLock,
     base: Dir,
-    name: String,
-    destination: String,
+    host: &'host Host,
 }
 
 fn lock_host(base: &Dir) -> Result<secure::ExclusiveLock> {
@@ -200,8 +200,8 @@ impl TestHooks {
     }
 }
 
-impl HostSession {
-    pub(crate) fn open(data: &Path, host: &Host) -> Result<Self> {
+impl<'host> HostSession<'host> {
+    pub(crate) fn open(data: &Path, host: &'host Host) -> Result<Self> {
         host.validate()
             .map_err(|error| with_kind(error, TaskErrorKind::Internal))?;
         let base = (|| {
@@ -223,8 +223,7 @@ impl HostSession {
         Ok(Self {
             _lock: lock,
             base,
-            name: host.name.clone(),
-            destination: host.destination.clone(),
+            host,
         })
     }
 
@@ -236,13 +235,11 @@ impl HostSession {
 
     pub(crate) fn collect(
         &self,
-        host: &Host,
-        harness: &str,
+        harness: Harness,
         limits: &Limits,
         cancellation: CancellationToken,
     ) -> Result<ArchiveOutcome> {
         self.collect_inner(
-            host,
             harness,
             limits,
             cancellation,
@@ -254,26 +251,21 @@ impl HostSession {
     #[cfg(test)]
     pub(crate) fn collect_with_hooks(
         &self,
-        host: &Host,
-        harness: &str,
+        harness: Harness,
         limits: &Limits,
         cancellation: CancellationToken,
         hooks: &TestHooks,
     ) -> Result<ArchiveOutcome> {
-        self.collect_inner(host, harness, limits, cancellation, Some(hooks))
+        self.collect_inner(harness, limits, cancellation, Some(hooks))
     }
 
     fn collect_inner(
         &self,
-        host: &Host,
-        harness: &str,
+        harness: Harness,
         limits: &Limits,
         cancellation: CancellationToken,
         #[cfg(test)] hooks: Option<&TestHooks>,
     ) -> Result<ArchiveOutcome> {
-        if host.name != self.name || host.destination != self.destination {
-            bail!(CoreError::Task(TaskErrorKind::Internal));
-        }
         #[cfg(test)]
         if let Some(hooks) = hooks {
             hooks.hit(TestCheckpoint::BeforeHarness)?;
@@ -286,8 +278,7 @@ impl HostSession {
         let mut wire_left = limits
             .wire_limit()
             .map_err(|error| with_kind(error, TaskErrorKind::LimitExceeded))?;
-        let script = collectors::script(host, harness)
-            .map_err(|error| with_kind(error, TaskErrorKind::Internal))?;
+        let script = collectors::script(self.host, harness);
         let txn = self
             .base
             .child(".transaction", true)
@@ -298,8 +289,14 @@ impl HostSession {
             let spool = txn
                 .create_new("spool")
                 .context(CoreError::Task(TaskErrorKind::LocalStorage))?;
-            let stream = remote::fetch(&host.destination, script, spool, &deadline, &mut wire_left)
-                .map_err(|error| with_kind(error, TaskErrorKind::Transport))?;
+            let stream = remote::fetch(
+                &self.host.destination,
+                script,
+                spool,
+                &deadline,
+                &mut wire_left,
+            )
+            .map_err(|error| with_kind(error, TaskErrorKind::Transport))?;
             let artifacts = txn
                 .child("artifacts", true)
                 .context(CoreError::Task(TaskErrorKind::LocalStorage))?;
@@ -309,7 +306,7 @@ impl HostSession {
             if !found {
                 return Ok(ArchiveOutcome::NotFound);
             }
-            if harness == "opencode" {
+            if harness == Harness::OpenCode {
                 if paths != ["inventory.json"] {
                     bail!(CoreError::Task(TaskErrorKind::InvalidRemoteStream));
                 }
@@ -326,7 +323,7 @@ impl HostSession {
                     .create_new("exports-spool")
                     .context(CoreError::Task(TaskErrorKind::LocalStorage))?;
                 let stream = remote::fetch(
-                    &host.destination,
+                    &self.host.destination,
                     collectors::exports(&ids),
                     spool,
                     &deadline,
@@ -346,11 +343,23 @@ impl HostSession {
             publication_attempted = true;
             #[cfg(test)]
             let publication = transaction::publish_with_hooks(
-                &self.base, &txn, &artifacts, harness, &paths, &deadline, hooks,
+                &self.base,
+                &txn,
+                &artifacts,
+                harness.as_str(),
+                &paths,
+                &deadline,
+                hooks,
             );
             #[cfg(not(test))]
-            let publication =
-                transaction::publish(&self.base, &txn, &artifacts, harness, &paths, &deadline);
+            let publication = transaction::publish(
+                &self.base,
+                &txn,
+                &artifacts,
+                harness.as_str(),
+                &paths,
+                &deadline,
+            );
             publication.map_err(|error| with_kind(error, TaskErrorKind::LocalStorage))?;
             published = true;
             Ok(ArchiveOutcome::Collected {
@@ -547,7 +556,7 @@ mod tests {
                 cancellation.cancel();
             }
             let error = session
-                .collect(&host, "pi", &Limits::default(), cancellation)
+                .collect(Harness::Pi, &Limits::default(), cancellation)
                 .unwrap_err();
             assert_eq!(
                 crate::error::classify(&error),

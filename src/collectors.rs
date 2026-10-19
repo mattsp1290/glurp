@@ -1,4 +1,5 @@
 //! Literal script generation and OpenCode's global inventory contract.
+use crate::collection::Harness;
 use crate::config::Host;
 use crate::error::{CoreError, TaskErrorKind, with_kind};
 use crate::remote::{CheckedReader, Deadline};
@@ -12,39 +13,38 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub fn script(host: &Host, harness: &str) -> Result<String> {
+pub fn script(host: &Host, harness: Harness) -> String {
     let (roots, automatic, executable) = match harness {
-        "claude" => (
+        Harness::Claude => (
             &host.claude_paths,
             "${CLAUDE_CONFIG_DIR:-\"$HOME/.claude\"}",
             "claude",
         ),
-        "codex" => (
+        Harness::Codex => (
             &host.codex_paths,
             "${CODEX_HOME:-\"$HOME/.codex\"}",
             "codex",
         ),
-        "pi" => (
+        Harness::Pi => (
             &host.pi_paths,
             "${PI_CODING_AGENT_SESSION_DIR:-\"${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions\"}",
             "pi",
         ),
-        "opencode" => return Ok(opencode_inventory()),
-        _ => return Err(CoreError::Task(TaskErrorKind::Internal).into()),
+        Harness::OpenCode => return opencode_inventory(),
     };
     let arguments = if roots.is_empty() {
         format!("\"{automatic}\"")
     } else {
         roots.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" ")
     };
-    Ok(format!(
+    format!(
         "harness={}\nexecutable={}\nrequired={}\nset -- {}\n{}",
-        quote(harness),
+        quote(harness.as_str()),
         quote(executable),
         u8::from(!roots.is_empty()),
         arguments,
         include_str!("files.sh")
-    ))
+    )
 }
 
 const OPEN_PRELUDE: &str = r#"set -efu

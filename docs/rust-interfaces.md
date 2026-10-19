@@ -119,6 +119,10 @@ according to that context. Native Unix archive paths need not be UTF-8. A
 collection using a non-UTF-8 archive root can succeed and return a valid native
 report, while default serde serialization of its `PathBuf` archive directory
 can fail (including JSON serialization). Paths are not converted lossily.
+Creating such paths also depends on the underlying filesystem: [APFS requires
+valid UTF-8 filenames](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/FAQ/FAQ.html).
+The filesystem round-trip test runs on Linux (including musl); the native report
+serialization check runs across the portable suite.
 
 `ProgressEvent { host, harness, phase, artifact_count }` contains only task
 identity, `ProgressPhase::Starting` or `Finished`, and an optional coarse count.

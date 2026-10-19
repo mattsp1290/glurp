@@ -362,19 +362,12 @@ fn collect_blocking(
                 emit(&control, &host, harness, ProgressPhase::Starting, None);
                 #[cfg(test)]
                 let outcome = if let Some(hooks) = &control.test_hooks {
-                    session.collect_with_hooks(
-                        &host,
-                        harness.as_str(),
-                        &request.limits,
-                        token.clone(),
-                        hooks,
-                    )
+                    session.collect_with_hooks(harness, &request.limits, token.clone(), hooks)
                 } else {
-                    session.collect(&host, harness.as_str(), &request.limits, token.clone())
+                    session.collect(harness, &request.limits, token.clone())
                 };
                 #[cfg(not(test))]
-                let outcome =
-                    session.collect(&host, harness.as_str(), &request.limits, token.clone());
+                let outcome = session.collect(harness, &request.limits, token.clone());
                 match outcome {
                     Ok(ArchiveOutcome::Collected { artifact_count }) => TaskStatus::Collected {
                         artifact_count,

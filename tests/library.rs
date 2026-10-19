@@ -1,7 +1,7 @@
 //! Integration coverage uses only glurp's supported public exports. Each test
 //! runs a private child process so PATH/HOME and platform fault injection never
 //! race unrelated tests or mutate the embedding process's environment.
-#[path = "consumer/src/scenarios.rs"]
+#[path = "consumer/src/scenarios/mod.rs"]
 mod scenarios;
 
 use std::fs;
@@ -173,9 +173,33 @@ fn portable_invalid_requests_reject_before_transport_or_transactions() {
 fn portable_invalid_local_path_syntax_rejects_both_input_modes_without_prefix_directories() {
     scenario("invalid_local_paths");
 }
+// Linux filesystems can round-trip non-UTF-8 names; macOS APFS requires UTF-8.
+#[cfg(target_os = "linux")]
 #[test]
 fn portable_non_utf8_archive_paths_return_native_reports_but_cannot_serialize_to_json() {
     scenario("non_utf8_path");
+}
+#[test]
+fn portable_native_non_utf8_report_paths_cannot_serialize_to_json() {
+    use std::os::unix::ffi::OsStringExt;
+
+    use glurp::{CollectionReport, Harness, TaskReport, TaskStatus};
+
+    let archive_dir = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        b"/archive-\xff/hosts/lab/codex".to_vec(),
+    ));
+    let report = CollectionReport {
+        tasks: vec![TaskReport {
+            host: "lab".into(),
+            harness: Harness::Codex,
+            status: TaskStatus::Collected {
+                artifact_count: 1,
+                archive_dir,
+            },
+        }],
+    };
+    assert!(report.is_success());
+    assert!(serde_json::to_string(&report).is_err());
 }
 #[test]
 fn portable_stored_snapshot_releases_config_lock_before_ssh() {
