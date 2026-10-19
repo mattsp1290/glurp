@@ -87,7 +87,7 @@ Pin the collection implementation to an exact revision:
 
 ```toml
 [dependencies]
-glurp = { git = "https://github.com/mattsp1290/glurp.git", rev = "c20b4f34f66b574464792d2cf67eeedc2e70f21d" }
+glurp = { git = "https://github.com/mattsp1290/glurp.git", rev = "8c05ecfbcc4d57f763fba5e0ef103931d50bc627" }
 tokio = { version = "1", features = ["rt", "macros", "signal"] }
 ```
 
@@ -192,7 +192,7 @@ make git-consumer-test
 # After an authorized push, test the exact remote implementation commit:
 python3 -S distribution/tests/check_git_consumer.py \
   --repository https://github.com/mattsp1290/glurp.git \
-  --revision c20b4f34f66b574464792d2cf67eeedc2e70f21d
+  --revision 8c05ecfbcc4d57f763fba5e0ef103931d50bc627
 ```
 
 The verification script builds and runs a temporary standalone Git-pinned
