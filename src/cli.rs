@@ -192,8 +192,7 @@ fn collect_command(
     Ok(())
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<()> {
     // An upgrade must not open configuration, acquire archive locks or contact SSH.
     if let Commands::Upgrade {
         check,
@@ -261,9 +260,28 @@ fn run() -> Result<()> {
 }
 
 pub(crate) fn main() -> i32 {
-    if let Err(error) = run() {
+    main_from(std::env::args_os())
+}
+
+fn main_from<I, T>(args: I) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = error.print();
+            return code;
+        }
+    };
+    if let Err(error) = run(cli) {
         eprintln!("glurp: {error:#}");
         return 1;
     }
     0
 }
+
+#[cfg(test)]
+mod tests;

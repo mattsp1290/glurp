@@ -4,6 +4,7 @@
 //! process. Several collect calls deliberately overlap inside that process.
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -340,7 +341,10 @@ pub async fn run(name: &str, f: &Fixture) {
         "equivalence" => equivalence(f).await,
         "roots" => roots(f).await,
         "validation" => validation(f).await,
+        "invalid_local_paths" => invalid_local_paths(f).await,
+        "non_utf8_path" => non_utf8_path(f).await,
         "config_lock" => config_lock(f).await,
+        "config_lock_enolck" | "config_lock_eio" => config_lock_error(f).await,
         "timer" => timer(f).await,
         "independent_cancel" => independent_cancel(f).await,
         "shared_cancel" => shared_cancel(f).await,
@@ -352,6 +356,8 @@ pub async fn run(name: &str, f: &Fixture) {
         "privacy" => privacy(f).await,
         "timeout" => timeout(f).await,
         "partial_cleanup" => partial_cleanup(f).await,
+        "partial_cleanup_cancel" => postcommit_cancel(f, true).await,
+        "clean_postcommit_cancel" => postcommit_cancel(f, false).await,
         "between_harnesses" => between_harnesses(f).await,
         "seed_partial_cleanup" => seed_partial_cleanup(f).await,
         _ => panic!("unknown fixture scenario"),
@@ -678,6 +684,7 @@ async fn config_lock(f: &Fixture) {
     lock.try_lock_exclusive()
         .expect("the configuration snapshot lock leaked into SSH work");
     // An independent stored invocation reports config contention before transport.
+    let contacts_before = f.contacts().len();
     assert!(matches!(
         collect(
             f.stored("other", vec![], vec![]),
@@ -686,6 +693,8 @@ async fn config_lock(f: &Fixture) {
         .await,
         Err(CollectionError::ConfigBusy)
     ));
+    assert_eq!(f.contacts().len(), contacts_before);
+    assert!(!f.root.join("other").exists());
     FileExt::unlock(&lock).unwrap();
     f.release("paused");
     collected(
@@ -696,6 +705,101 @@ async fn config_lock(f: &Fixture) {
             .unwrap(),
         1,
     );
+}
+
+async fn invalid_local_paths(f: &Fixture) {
+    f.config(&[f.host("lab", "lab")]);
+    for (index, suffix) in ["nul\0component/end", "dot/./end", "parent/../end"]
+        .into_iter()
+        .enumerate()
+    {
+        for source in ["explicit", "stored_archive", "stored_config"] {
+            let prefix = f.root.join(format!("invalid-{source}-{index}"));
+            let invalid = prefix.join(suffix);
+            let source = match source {
+                "explicit" => InputSource::Explicit {
+                    hosts: vec![f.host("lab", "lab")],
+                    archive_root: invalid,
+                },
+                "stored_archive" => InputSource::Stored {
+                    config_dir: f.root.join("config"),
+                    archive_root: invalid,
+                    hosts: vec![],
+                },
+                "stored_config" => InputSource::Stored {
+                    config_dir: invalid,
+                    archive_root: f.root.join("archive"),
+                    hosts: vec![],
+                },
+                _ => unreachable!(),
+            };
+            assert!(matches!(
+                collect(
+                    CollectionRequest {
+                        source,
+                        harnesses: vec![Harness::Codex],
+                        limits: Limits::default(),
+                    },
+                    CollectionControl::default(),
+                )
+                .await,
+                Err(CollectionError::InvalidInput)
+            ));
+            assert!(
+                !prefix.exists(),
+                "invalid syntax created a prefix directory"
+            );
+            assert!(!f.root.join("archive").exists());
+            assert!(!f.root.join("config/config.lock").exists());
+            assert!(f.contacts().is_empty());
+        }
+    }
+}
+
+async fn non_utf8_path(f: &Fixture) {
+    f.remote(".codex/session_index.jsonl", b"native path bytes\0\xff");
+    let root = f
+        .root
+        .join(std::ffi::OsString::from_vec(b"archive-\xff".to_vec()));
+    let report = result(CollectionRequest {
+        source: InputSource::Explicit {
+            hosts: vec![f.host("lab", "lab")],
+            archive_root: root.clone(),
+        },
+        harnesses: vec![Harness::Codex],
+        limits: Limits::default(),
+    })
+    .await;
+    collected(&report, 1);
+    let expected = root.join("hosts/lab/codex");
+    assert!(matches!(
+        &report.tasks[0].status,
+        TaskStatus::Collected { archive_dir, .. } if archive_dir == &expected
+    ));
+    assert_eq!(
+        fs::read(expected.join("session_index.jsonl")).unwrap(),
+        b"native path bytes\0\xff"
+    );
+    // Successful native Unix paths need not have a JSON string representation.
+    assert!(serde_json::to_string(&report).is_err());
+    assert_eq!(f.contacts(), ["lab"]);
+}
+
+async fn config_lock_error(f: &Fixture) {
+    f.config(&[f.host("lab", "lab")]);
+    let before = fs::read(f.root.join("config/config.json")).unwrap();
+    let error = collect(
+        f.stored("archive", vec![], vec![Harness::Codex]),
+        CollectionControl::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, CollectionError::InvalidConfig);
+    assert!(std::error::Error::source(&error).is_none());
+    assert_eq!(serde_json::to_string(&error).unwrap(), "\"invalid_config\"");
+    assert_eq!(fs::read(f.root.join("config/config.json")).unwrap(), before);
+    assert!(f.contacts().is_empty());
+    assert!(!f.root.join("archive").exists());
 }
 
 async fn timer(f: &Fixture) {
@@ -837,6 +941,9 @@ async fn dropped(f: &Fixture) {
 }
 
 async fn queued(f: &Fixture) {
+    use std::future::Future;
+    use std::task::Poll;
+
     // run() uses max_blocking_threads(1), making worker admission deterministic.
     for drop_future in [false, true] {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -847,20 +954,23 @@ async fn queued(f: &Fixture) {
         });
         entered_rx.await.unwrap();
         let token = CancellationToken::new();
-        let queued = tokio::spawn(collect(f.single("queued", "lab"), controlled(&token)));
-        tokio::task::yield_now().await;
+        let mut queued = Box::pin(collect(f.single("queued", "lab"), controlled(&token)));
+        std::future::poll_fn(|cx| {
+            assert!(queued.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
         if drop_future {
-            queued.abort();
+            // Drop the actual future while its worker is still queued. Aborting
+            // a spawned task would only request Drop and race worker admission.
+            drop(queued);
+            assert!(!token.is_cancelled());
+            release_tx.send(()).unwrap();
         } else {
             token.cancel();
-        }
-        release_tx.send(()).unwrap();
-        if drop_future {
-            assert!(queued.await.unwrap_err().is_cancelled());
-            assert!(!token.is_cancelled());
-        } else {
+            release_tx.send(()).unwrap();
             assert!(matches!(
-                queued.await.unwrap(),
+                queued.await,
                 Err(CollectionError::CancelledBeforePlanning)
             ));
         }
@@ -1220,6 +1330,138 @@ async fn partial_cleanup(f: &Fixture) {
     assert_eq!(f.contacts().len(), contact_count);
     assert_eq!(fs::read(txn.join("committed")).unwrap(), evidence);
     assert_eq!(fs::read(txn.join("backups/1")).unwrap(), b"original");
+}
+
+async fn postcommit_cancel(f: &Fixture, partial_cleanup: bool) {
+    // The parent seeds the previous generation before enabling interposition.
+    // Pause the real cleanup syscall after commit, before the driver can admit
+    // another harness. In the failing case backup 0 has already been removed.
+    f.remote(".claude/projects/a.jsonl", b"changed!");
+    f.remote(".claude/projects/b.jsonl", b"changed!");
+    f.remote(".codex/session_index.jsonl", b"must not be collected");
+    f.remote(".pi/agent/sessions/session.jsonl", b"must not be collected");
+    let contacts_before = f.contacts().len();
+    let token = CancellationToken::new();
+    let work = tokio::spawn(collect(
+        f.request(
+            vec![f.host("a_fault", "lab"), f.host("z_unstarted", "lab")],
+            vec![Harness::Claude, Harness::Codex, Harness::Pi],
+        ),
+        controlled(&token),
+    ));
+    f.wait_file("between-entered").await;
+    let base = f.root.join("archive/hosts/a_fault");
+    let txn = base.join(".transaction");
+    let file_state = |path: &Path| {
+        (
+            fs::read(path).unwrap(),
+            fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    };
+    let evidence = if partial_cleanup {
+        assert!(!txn.join("backups/0").exists());
+        assert_eq!(fs::read(txn.join("backups/1")).unwrap(), b"original");
+        Some((
+            file_state(&txn.join("committed")),
+            file_state(&txn.join("backups/1")),
+        ))
+    } else {
+        assert!(!txn.exists());
+        None
+    };
+    for path in ["claude/projects/a.jsonl", "claude/projects/b.jsonl"] {
+        assert_eq!(fs::read(base.join(path)).unwrap(), b"changed!");
+    }
+    let committed = snapshot(&base);
+    assert_eq!(f.contacts().len(), contacts_before + 1);
+    assert!(!work.is_finished());
+    token.cancel();
+    fs::write(f.root.join("between-release"), b"release").unwrap();
+    let report = tokio::time::timeout(WAIT, work)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report
+            .tasks
+            .iter()
+            .map(|task| (task.host.as_str(), task.harness))
+            .collect::<Vec<_>>(),
+        [
+            ("a_fault", Harness::Claude),
+            ("a_fault", Harness::Codex),
+            ("a_fault", Harness::Pi),
+            ("z_unstarted", Harness::Claude),
+            ("z_unstarted", Harness::Codex),
+            ("z_unstarted", Harness::Pi),
+        ]
+    );
+    assert!(matches!(
+        report.tasks[0].status,
+        TaskStatus::Collected {
+            artifact_count: 2,
+            ..
+        }
+    ));
+    let remaining = if partial_cleanup {
+        TaskStatus::Failed {
+            kind: TaskErrorKind::RecoveryRequired,
+        }
+    } else {
+        TaskStatus::NotStartedDueToCancellation
+    };
+    assert!(
+        report.tasks[1..3]
+            .iter()
+            .all(|task| task.status == remaining)
+    );
+    assert!(
+        report.tasks[3..]
+            .iter()
+            .all(|task| matches!(task.status, TaskStatus::NotStartedDueToCancellation))
+    );
+    assert!(!report.is_success());
+    assert_eq!(f.contacts().len(), contacts_before + 1);
+    assert!(!f.root.join("archive/hosts/z_unstarted").exists());
+    assert!(!base.join("codex").exists());
+    assert!(!base.join("pi").exists());
+    assert_eq!(snapshot(&base), committed);
+    assert!(!base.join(".recovery").exists());
+    assert!(fs::read_dir(&base).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".stage-")
+    }));
+    if let Some((journal, backup)) = evidence {
+        assert_eq!(file_state(&txn.join("committed")), journal);
+        assert_eq!(file_state(&txn.join("backups/1")), backup);
+        assert!(!txn.join("backups/0").exists());
+        // Re-admission still refuses ambiguous evidence and cannot change it.
+        let retry = result(f.request(
+            vec![f.host("a_fault", "lab")],
+            vec![Harness::Claude, Harness::Codex, Harness::Pi],
+        ))
+        .await;
+        assert!(retry.tasks.iter().all(|task| task.status == remaining));
+        assert_eq!(file_state(&txn.join("committed")), journal);
+        assert_eq!(file_state(&txn.join("backups/1")), backup);
+        assert!(!txn.join("backups/0").exists());
+        assert_eq!(snapshot(&base), committed);
+        assert_eq!(f.contacts().len(), contacts_before + 1);
+    } else {
+        f.clean("a_fault");
+    }
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(base.join("archive.lock"))
+        .unwrap();
+    lock.try_lock_exclusive()
+        .expect("awaited cancellation must release the host lease");
+    FileExt::unlock(&lock).unwrap();
 }
 
 pub async fn seed_partial_cleanup(f: &Fixture) {

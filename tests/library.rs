@@ -27,14 +27,24 @@ fn check_child(f: &Fixture, scenario: &str, preload: Option<&std::path::Path>) {
             .env("LD_PRELOAD", preload)
             .env(
                 "GLURP_FAULT_MODE",
-                if scenario == "between_harnesses" {
-                    "pause-after-cleanup"
-                } else {
-                    "commit-partial-cleanup"
+                match scenario {
+                    "between_harnesses" | "clean_postcommit_cancel" => "pause-after-cleanup",
+                    "partial_cleanup" => "commit-partial-cleanup",
+                    "partial_cleanup_cancel" => "commit-partial-cleanup-cancel",
+                    "config_lock_enolck" => "config-lock-enolck",
+                    "config_lock_eio" => "config-lock-eio",
+                    _ => panic!("scenario does not define an external fault mode"),
                 },
             )
             .env("GLURP_FAULT_LOG", f.root.join("fault.log"))
-            .env("GLURP_PAUSE_HOST_DIR", f.root.join("data/glurp/hosts/lab"))
+            .env(
+                "GLURP_PAUSE_HOST_DIR",
+                f.root.join(if scenario == "between_harnesses" {
+                    "data/glurp/hosts/lab"
+                } else {
+                    "archive/hosts/a_fault"
+                }),
+            )
             .env("GLURP_PAUSE_ENTERED", f.root.join("between-entered"))
             .env("GLURP_PAUSE_RELEASE", f.root.join("between-release"));
     }
@@ -160,6 +170,14 @@ fn portable_invalid_requests_reject_before_transport_or_transactions() {
     scenario("validation");
 }
 #[test]
+fn portable_invalid_local_path_syntax_rejects_both_input_modes_without_prefix_directories() {
+    scenario("invalid_local_paths");
+}
+#[test]
+fn portable_non_utf8_archive_paths_return_native_reports_but_cannot_serialize_to_json() {
+    scenario("non_utf8_path");
+}
+#[test]
 fn portable_stored_snapshot_releases_config_lock_before_ssh() {
     scenario("config_lock");
 }
@@ -242,6 +260,47 @@ fn linux_partial_postcommit_cleanup_blocks_later_harnesses_preserves_evidence_an
             .unwrap()
             .contains("partial-cleanup-failed")
     );
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[test]
+fn linux_partial_postcommit_cleanup_takes_priority_over_cancellation_without_admitting_later_hosts()
+{
+    let f = Fixture::create();
+    check_child(&f, "seed_partial_cleanup", None);
+    let library = fault_shim(&f);
+    check_child(&f, "partial_cleanup_cancel", Some(&library));
+    assert_eq!(
+        fs::read_to_string(f.root.join("fault.log")).unwrap(),
+        "commit-sync-succeeded\ncleanup-paused\ncleanup-released\npartial-cleanup-failed\n"
+    );
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[test]
+fn linux_clean_postcommit_cancellation_preserves_success_and_leaves_remaining_tasks_unstarted() {
+    let f = Fixture::create();
+    check_child(&f, "seed_partial_cleanup", None);
+    let library = fault_shim(&f);
+    check_child(&f, "clean_postcommit_cancel", Some(&library));
+    assert_eq!(
+        fs::read_to_string(f.root.join("fault.log")).unwrap(),
+        "cleanup-paused\ncleanup-released\n"
+    );
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[test]
+fn linux_non_contention_config_lock_errors_report_invalid_config() {
+    for (scenario, event) in [
+        ("config_lock_enolck", "config-lock-enolck\n"),
+        ("config_lock_eio", "config-lock-eio\n"),
+    ] {
+        let f = Fixture::create();
+        let library = fault_shim(&f);
+        check_child(&f, scenario, Some(&library));
+        assert_eq!(fs::read_to_string(f.root.join("fault.log")).unwrap(), event);
+    }
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]

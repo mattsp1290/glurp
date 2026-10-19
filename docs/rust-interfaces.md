@@ -54,7 +54,9 @@ pub fn default_paths() -> Result<CollectionPaths, CollectionError>;
   is not archived or included in the reported artifact count.
 
 Validation rejects bad aliases, duplicate aliases, destinations, source roots,
-local roots, and limits before SSH or archive transaction creation. Source-root
+local roots, and limits before SSH or archive transaction creation. Local paths
+must be absolute and contain no NUL bytes or literal `.`/`..` components; invalid
+local-path syntax is rejected before any directories are created. Source-root
 rules are the same as CLI rules below. Direct inputs and explicit stored paths
 need no environment-based discovery. The optional `default_paths()` helper
 reads existing `HOME`/XDG rules and returns
@@ -98,6 +100,8 @@ finished results and explicitly marks remaining planned tasks.
 category. The normal lease-contention result is the dedicated `Busy` status.
 Request-level `CollectionError` has `InvalidInput`, `InvalidConfig`,
 `ConfigBusy`, `MissingRuntime`, `CancelledBeforePlanning`, and `WorkerFailure`.
+`ConfigBusy` means configuration-lock contention; other configuration-lock
+failures use `InvalidConfig`.
 Before selection produces a plan, cancellation returns `CancelledBeforePlanning`
 without inventing task identities. After planning, the final report contains
 all tasks. Error enums are non-exhaustive; downstream matches should keep a
@@ -111,7 +115,10 @@ or `pi`. Ordinary library execution produces no stdout/stderr and never
 writes environment variables, installs signal handlers, changes a panic hook,
 or exits the application. The application controls all logging. Final successful
 task results may contain a caller-selected local archive path; protect reports
-according to that context.
+according to that context. Native Unix archive paths need not be UTF-8. A
+collection using a non-UTF-8 archive root can succeed and return a valid native
+report, while default serde serialization of its `PathBuf` archive directory
+can fail (including JSON serialization). Paths are not converted lossily.
 
 `ProgressEvent { host, harness, phase, artifact_count }` contains only task
 identity, `ProgressPhase::Starting` or `Finished`, and an optional coarse count.

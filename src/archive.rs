@@ -228,6 +228,12 @@ impl HostSession {
         })
     }
 
+    /// Inspect retained transaction evidence under this session's host lease.
+    /// Readiness must take precedence over cancellation of subsequent tasks.
+    pub(crate) fn ensure_ready(&self) -> Result<()> {
+        transaction::recover(&self.base).context(CoreError::Task(TaskErrorKind::RecoveryRequired))
+    }
+
     pub(crate) fn collect(
         &self,
         host: &Host,
@@ -274,8 +280,7 @@ impl HostSession {
         }
         // A prior task can be Collected while durable committed evidence remains
         // after partial cleanup. Never reuse that staging directory or start SSH.
-        transaction::recover(&self.base)
-            .context(CoreError::Task(TaskErrorKind::RecoveryRequired))?;
+        self.ensure_ready()?;
         let deadline = Deadline::new(limits.timeout_seconds, cancellation);
         deadline.check()?;
         let mut wire_left = limits

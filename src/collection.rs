@@ -9,7 +9,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -113,6 +113,8 @@ pub struct CollectionControl {
     pub(crate) panic_worker: bool,
 }
 
+/// A task's native outcome. Successful archive paths may contain non-UTF-8
+/// Unix bytes; serde serialization of those paths returns an error.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -215,10 +217,7 @@ pub async fn collect(
 }
 
 fn valid_absolute(path: &Path) -> bool {
-    path.is_absolute()
-        && path
-            .components()
-            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    crate::secure::valid_absolute_path(path)
 }
 fn check_cancel(token: &CancellationToken) -> Result<(), CollectionError> {
     if token.is_cancelled() {
@@ -342,6 +341,15 @@ fn collect_blocking(
         let mut recovery_required = matches!(&session, Some(Err(error))
             if classify(error) == CoreError::Task(TaskErrorKind::RecoveryRequired));
         for &harness in &harnesses {
+            // A successful commit can leave ambiguous evidence when cleanup
+            // fails. Inspect it while retaining this host's lease, even if
+            // cancellation would otherwise skip every remaining harness.
+            if !recovery_required
+                && let Some(Ok(session)) = &session
+                && session.ensure_ready().is_err()
+            {
+                recovery_required = true;
+            }
             let status = if recovery_required {
                 TaskStatus::Failed {
                     kind: TaskErrorKind::RecoveryRequired,

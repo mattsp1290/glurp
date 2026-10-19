@@ -33,6 +33,20 @@ impl Drop for ExclusiveLock {
 
 pub struct Dir(File);
 
+/// Validate native local-path syntax before opening or creating any storage.
+/// Inspect raw bytes because `Path::components` normalizes interior dots.
+pub(crate) fn valid_absolute_path(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    path.is_absolute()
+        && !bytes.contains(&0)
+        && !bytes
+            .split(|byte| *byte == b'/')
+            .any(|part| part == b"." || part == b"..")
+        && path
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+}
+
 fn name(value: &OsStr) -> Result<CString> {
     if value.as_bytes().is_empty()
         || value.as_bytes().contains(&b'/')
@@ -68,16 +82,10 @@ fn check_dir(file: File, private: bool) -> Result<Dir> {
 }
 impl Dir {
     pub fn open(path: &Path, create: bool) -> Result<Self> {
-        if path
-            .as_os_str()
-            .as_bytes()
-            .split(|b| *b == b'/')
-            .any(|part| part == b"." || part == b"..")
-        {
-            bail!("unsafe storage path component");
-        }
-        if !path.is_absolute() {
-            bail!("storage directory must be absolute");
+        if !valid_absolute_path(path) {
+            bail!(
+                "storage directory must be absolute and contain no NUL, dot or parent components"
+            );
         }
         let root = CString::new("/").unwrap();
         let fd = unsafe {
@@ -347,6 +355,42 @@ mod tests {
             .tempdir()
             .unwrap()
     }
+
+    #[test]
+    fn absolute_path_validation_preserves_native_paths_and_rejects_invalid_syntax() {
+        for valid in [
+            b"/".as_slice(),
+            b"/tmp/private",
+            b"/tmp//private/",
+            b"/tmp/\xff",
+        ] {
+            assert!(valid_absolute_path(Path::new(OsStr::from_bytes(valid))));
+        }
+        for invalid in [
+            b"".as_slice(),
+            b"relative/path",
+            b"/tmp/./private",
+            b"/tmp/../private",
+            b"/tmp/private/.",
+            b"/tmp/private/..",
+            b"/tmp/private/nul\0component",
+        ] {
+            assert!(!valid_absolute_path(Path::new(OsStr::from_bytes(invalid))));
+        }
+    }
+
+    #[test]
+    fn invalid_absolute_path_does_not_create_prefix_directories() {
+        let storage = temp();
+        let root = storage.path().canonicalize().unwrap();
+        for suffix in [b"./leaf".as_slice(), b"../leaf", b"nul\0component"] {
+            let prefix = root.join("must-not-exist");
+            let path = prefix.join(OsStr::from_bytes(suffix));
+            assert!(Dir::open(&path, true).is_err());
+            assert!(!prefix.exists());
+        }
+    }
+
     #[test]
     fn swapped_directory_name_cannot_redirect_anchored_writes() {
         let storage = temp();

@@ -112,7 +112,14 @@ impl Store {
         }
         let dir = secure::Dir::open(path.parent().context("config parent missing")?, true)?;
         let lock = dir.file("config.lock", true)?;
-        let lock = secure::ExclusiveLock::try_lock(lock).context(CollectionError::ConfigBusy)?;
+        let lock = secure::ExclusiveLock::try_lock(lock).map_err(|error| {
+            let kind = if error.kind() == std::io::ErrorKind::WouldBlock {
+                CollectionError::ConfigBusy
+            } else {
+                CollectionError::InvalidConfig
+            };
+            anyhow::Error::new(error).context(kind)
+        })?;
         let hosts: Vec<Host> = match dir.file("config.json", false) {
             Ok(file) => {
                 let mut reader = ConfigReader {
@@ -264,7 +271,11 @@ mod tests {
         let path = temp.path().canonicalize().unwrap().join("config.json");
         let store = Store::open(&path).unwrap();
         let inherited = store._lock.clone_file_for_test().unwrap();
-        assert!(Store::open(&path).is_err());
+        let error = Store::open(&path).err().expect("snapshot lock is held");
+        assert_eq!(
+            error.downcast_ref::<CollectionError>(),
+            Some(&CollectionError::ConfigBusy)
+        );
         drop(store);
         // A concurrent process fork can retain this same open-file description
         // until exec. It does not own the completed snapshot's lease.

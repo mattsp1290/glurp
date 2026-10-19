@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 static int step;
@@ -29,11 +30,51 @@ static void record(const char *event) {
     real_write(fd, event, strlen(event));
     close(fd);
 }
+static int partial_cleanup_mode(const char *mode) {
+    return mode && (strcmp(mode, "commit-partial-cleanup") == 0 ||
+                    strcmp(mode, "commit-partial-cleanup-cancel") == 0);
+}
+static int pause_cleanup(void) {
+    const char *entered = getenv("GLURP_PAUSE_ENTERED");
+    const char *release = getenv("GLURP_PAUSE_RELEASE");
+    if (!entered || !release) { errno = EINVAL; return -1; }
+    int marker = open(entered, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (marker < 0) return -1;
+    close(marker);
+    record("cleanup-paused\n");
+    for (int attempt = 0; attempt < 20000; attempt++) {
+        if (access(release, F_OK) == 0) {
+            record("cleanup-released\n");
+            return 0;
+        }
+        usleep(1000);
+    }
+    record("cleanup-barrier-timeout\n");
+    errno = ETIMEDOUT;
+    return -1;
+}
+int flock(int fd, int operation) {
+    int (*real_flock)(int, int) = dlsym(RTLD_NEXT, "flock");
+    const char *mode = getenv("GLURP_FAULT_MODE");
+    char path[8192];
+    if (mode && (strcmp(mode, "config-lock-enolck") == 0 || strcmp(mode, "config-lock-eio") == 0) &&
+        (operation & LOCK_EX) && (operation & LOCK_NB) && path_for(fd, path, sizeof(path))) {
+        const char *suffix = "/config/config.lock";
+        size_t n = strlen(path), suffix_len = strlen(suffix);
+        if (n >= suffix_len && strcmp(path + n - suffix_len, suffix) == 0) {
+            int injected = strcmp(mode, "config-lock-enolck") == 0 ? ENOLCK : EIO;
+            record(injected == ENOLCK ? "config-lock-enolck\n" : "config-lock-eio\n");
+            errno = injected;
+            return -1;
+        }
+    }
+    return real_flock(fd, operation);
+}
 int fsync(int fd) {
     int (*real_fsync)(int) = dlsym(RTLD_NEXT, "fsync");
     const char *mode = getenv("GLURP_FAULT_MODE");
     char path[8192];
-    if (mode && (strcmp(mode, "commit-two-syncs") == 0 || strcmp(mode, "commit-reverse") == 0 || (strcmp(mode, "commit-cleanup") == 0 || strcmp(mode, "commit-partial-cleanup") == 0) || (strcmp(mode, "commit-all-transitions") == 0 || strcmp(mode, "commit-no-marker") == 0)) && path_for(fd, path, sizeof(path))) {
+    if (mode && (strcmp(mode, "commit-two-syncs") == 0 || strcmp(mode, "commit-reverse") == 0 || (strcmp(mode, "commit-cleanup") == 0 || partial_cleanup_mode(mode)) || (strcmp(mode, "commit-all-transitions") == 0 || strcmp(mode, "commit-no-marker") == 0)) && path_for(fd, path, sizeof(path))) {
         size_t n = strlen(path);
         const char *suffix = "/.transaction";
         if (step == 0 && n >= strlen(suffix) && strcmp(path + n - strlen(suffix), suffix) == 0) {
@@ -42,7 +83,7 @@ int fsync(int fd) {
             snprintf(committed, sizeof(committed), "%s/committed", path);
             if (access(ready, F_OK) != 0 && access(committed, F_OK) == 0) {
                 step = 1;
-                if (strcmp(mode, "commit-cleanup") == 0 || strcmp(mode, "commit-partial-cleanup") == 0) { record("commit-sync-succeeded\n"); return real_fsync(fd); }
+                if (strcmp(mode, "commit-cleanup") == 0 || partial_cleanup_mode(mode)) { record("commit-sync-succeeded\n"); return real_fsync(fd); }
                 record("commit-sync-failed\n"); errno = EIO; return -1;
             }
         }
@@ -122,8 +163,10 @@ int unlinkat(int fd, const char *name, int flags) {
     int (*real_unlinkat)(int, const char *, int) = dlsym(RTLD_NEXT, "unlinkat");
     const char *mode = getenv("GLURP_FAULT_MODE");
     char path[8192];
-    if (mode && strcmp(mode, "commit-partial-cleanup") == 0 && step >= 1 &&
+    if (partial_cleanup_mode(mode) && step >= 1 &&
         strcmp(name, "1") == 0 && path_for(fd, path, sizeof(path)) && strstr(path, "/.transaction/backups")) {
+        if (strcmp(mode, "commit-partial-cleanup-cancel") == 0 &&
+            atomic_exchange(&cleanup_paused, 1) == 0 && pause_cleanup() != 0) return -1;
         record("partial-cleanup-failed\n"); errno = EIO; return -1;
     }
     int result = real_unlinkat(fd, name, flags);
@@ -135,23 +178,7 @@ int unlinkat(int fd, const char *name, int flags) {
         // Pause only after the first transaction directory was fully removed.
         // The production worker still owns its host lease and has not admitted
         // the next harness. This is an external, test-only syscall seam.
-        const char *entered = getenv("GLURP_PAUSE_ENTERED");
-        const char *release = getenv("GLURP_PAUSE_RELEASE");
-        if (!entered || !release) { errno = EINVAL; return -1; }
-        int marker = open(entered, O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (marker < 0) return -1;
-        close(marker);
-        record("cleanup-paused\n");
-        for (int attempt = 0; attempt < 20000; attempt++) {
-            if (access(release, F_OK) == 0) {
-                record("cleanup-released\n");
-                return result;
-            }
-            usleep(1000);
-        }
-        record("cleanup-barrier-timeout\n");
-        errno = ETIMEDOUT;
-        return -1;
+        if (pause_cleanup() != 0) return -1;
     }
     return result;
 }
