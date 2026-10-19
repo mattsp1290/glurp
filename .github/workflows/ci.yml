@@ -27,8 +27,16 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
-      - name: Test (including actual POSIX collector scripts)
+      - name: Test library, integration, and example targets (actual POSIX collectors)
         run: cargo test --all-targets --locked
+      - name: Test documentation examples
+        run: cargo test --doc --locked
+      - name: Test the locked standalone consumer
+        run: cargo test --manifest-path tests/consumer/Cargo.toml --locked
+      - name: Verify the exact checked-out Git dependency
+        run: |
+          python3 -S distribution/tests/check_git_consumer.py \
+            --repository "$GITHUB_WORKSPACE" --revision "$(git rev-parse HEAD)"
       - name: Release build
         run: cargo build --release --locked
       - name: Test the release manifest and installer

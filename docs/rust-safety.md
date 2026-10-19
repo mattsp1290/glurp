@@ -1,10 +1,13 @@
 # Private cumulative archive safety
 
-`glurp glurp` collects each selected host/harness independently. Hosts and
-harnesses are sorted and deduplicated. A failure produces a fixed, redacted
-summary and a nonzero exit code while other tasks continue. Remote stderr,
+`glurp glurp` and the in-process Rust `collect` API use the same collection
+engine. Each selected host/harness has an independent result. Hosts and
+harnesses are sorted and deduplicated. The CLI renders failures as fixed,
+redacted summaries and returns a nonzero exit code while other tasks continue.
+The library returns typed results for the application to handle. Remote stderr,
 transcript bytes, remote artifact paths, and JSON parser excerpts never appear
-in collection diagnostics. SIGINT/SIGTERM stop collection with a nonzero exit.
+in collection diagnostics. CLI SIGINT/SIGTERM stop collection with a nonzero
+exit. Library calls never install process signal handlers or exit the process.
 
 Unchanged artifacts retain their exact bytes and mtimes. Changed artifacts use
 same-filesystem atomic rename. Remote deletion, removal of a configured host,
@@ -12,9 +15,62 @@ and collection of a different harness never delete committed transcripts.
 `destination.json` permanently binds a used archive name to its SSH destination;
 remove/add cannot repurpose that archive name for another destination.
 
+## Embedding and cancellation safety
+
+Library requests own their inputs and run all configuration, SSH, validation,
+and storage work in a Tokio blocking worker. An existing Tokio runtime is
+required; the library never creates a hidden runtime. Explicit host input avoids
+the stored registry entirely and requires no `HOME`. Stored input reads a
+snapshot of `config_dir/config.json` under the short config lock, which is
+released before SSH. The loader may create the private config directory and
+lock file, but collection never changes registered hosts. Only the opt-in
+`default_paths()` helper reads environment-derived storage defaults. No library
+call mutates process environment, prints ordinary diagnostics, or changes the
+process panic hook.
+
+A private child cancellation token belongs to each invocation. Independent
+parent tokens isolate requests; cancelling a shared parent intentionally cancels
+all of its descendants. Dropping one future requests cancellation only for that
+call, never for its siblings or the caller's parent token. An unpolled future
+does no work; an already queued worker checks cancellation before side effects.
+
+Cancel and await the retained collection future to observe the cleanup boundary:
+SSH has been killed/reaped, ordinary rollback has finished or retained recovery
+evidence has been reported, and the worker has released its host lease before
+that awaited return. Merely dropping the future does not establish this boundary.
+The worker may still be running and retains the lease until cleanup is done.
+Callers must cancel and await active collections before shutting down their
+runtime; runtime shutdown is not a bounded cleanup mechanism. Rollback ignores
+collection cancellation and deadlines so it can restore originals. A stalled
+kernel filesystem call or recovery operation has no hard wall-clock guarantee.
+
+Cancellation before a host/harness plan exists returns `CancelledBeforePlanning`.
+Once the plan exists, all planned tasks remain represented: completed tasks keep
+their result, an interrupted task is `Cancelled`, and remaining tasks are
+`NotStartedDueToCancellation`. Durable commit wins a later cancellation race.
+Failed rollback or unsafe recovery evidence instead produces `RecoveryRequired`,
+which outranks cancellation and blocks further harnesses for that host.
+
+Ordinary public failures contain fixed typed categories, not remote stderr,
+artifact names, transcript bytes, parser excerpts, or internal error chains.
+Timeout/cancellation provenance is retained through frame and OpenCode JSON
+reads; a read interrupted by cancellation is not mislabeled malformed JSON.
+Best-effort progress uses only nonblocking bounded-channel sends and contains
+coarse task identities/phases/counts. Dropped receivers or lost terminal events
+do not delay cleanup; the final report is authoritative. Final successful task
+reports contain the caller-selected local archive directory, which callers must
+handle appropriately when logging or sharing reports.
+
+Unexpected panics can invoke the application's existing panic hook before the
+library returns a redacted `WorkerFailure`; the library does not suppress or
+replace arbitrary host/dependency panic-hook output. Catastrophic panic or abort
+can leave recoverable transaction evidence rather than a full report. The
+application owns its own panic-hook policy and process lifetime.
+
 ## Limits and timeout
 
-The collection command accepts:
+The CLI flags and public `Limits` fields apply separately to each host/harness
+task. There is no whole-batch timeout. The collection command accepts:
 
 | Flag | Default | Scope |
 | --- | --- | --- |
@@ -58,8 +114,14 @@ operations traverse from open directory descriptors using `openat` with
 `O_NOFOLLOW`, `mkdirat`, `renameat`, and `unlinkat`. Publication retains archive and staging root descriptors, traverses target
 parents with no-follow opens at each operation, and records file fingerprints.
 Descriptor use is bounded independently of artifact count. Replacing a checked pathname with a symlink
-cannot redirect subsequent operations to its target. Config and host archive
-locks refuse concurrent cooperating writers immediately. Ordinary unexpected
+cannot redirect subsequent operations to its target. Config locks and host
+archive leases refuse concurrent cooperating writers at admission. An archive lease is keyed by `(archive_root, host alias)` and retained
+across all selected harnesses and cleanup, including cleanup after future Drop.
+A competing library or CLI worker reports `Busy` for that host's tasks and can
+continue independent hosts. Admission happens when the worker reaches that host,
+not at API/future creation; queued work admitted after release may succeed.
+Different roots or aliases remain distinct archives even for the same remote.
+There is no automatic retry, wait, or coalescing. Ordinary unexpected
 file replacement or content modification is checked before replacement.
 
 The archive lock protects a per-host `.transaction` directory. The entire
@@ -75,7 +137,12 @@ Commit atomically renames the complete synced rollback journal from `ready.json`
 to `committed`, then syncs the transaction directory. This successful directory
 sync is the commit boundary. Only the live publisher that verified that sync
 may delete backups as successful-commit cleanup; a cleanup error does not turn
-that successful collection into a failed operation.
+that successful collection into a failed operation. Cancellation after this
+boundary also cannot roll back or relabel the task. Before every later harness
+under the same lease, recovery readiness is checked again. If postcommit cleanup
+left ambiguous evidence, the committed task stays `Collected`, later harnesses
+for that host report `RecoveryRequired`, and no new SSH or staging reuse occurs
+there. Independent hosts can continue if the call has not been cancelled.
 
 Restart recovery distinguishes these states under the archive lock, before SSH:
 
@@ -132,7 +199,7 @@ repair before retained backups can be restored.
 
 ## Synthetic verification
 
-All tests use canonical disposable roots, synthetic local/remote HOME/XDG,
+Collection fixtures use canonical disposable roots, synthetic local/remote HOME/XDG,
 and a utility-only fake remote PATH. CLI fixtures execute actual POSIX collector
 scripts and cover exact bytes, private modes, mtime preservation, cumulative
 retention, binding, limits (including OpenCode's inventory/export aggregate),
@@ -147,3 +214,14 @@ collection, fail the reverse transition, fault committed cleanup, and slow bound
 local comparison/backup operations to verify timeout and both cancellation signals
 without large disk writes. Directory-swap fixtures prove anchored writes cannot
 escape through substituted symlinks.
+
+
+The public-library fixtures use dedicated child processes to set synthetic
+HOME/PATH before execution, then perform multiple in-process calls against the
+actual POSIX collector scripts. This keeps process-global environment mutation
+out of concurrent test code. A standalone consumer with its own locked manifest
+covers the import boundary; a separate exact-revision Git-consumer check avoids
+mistaking a path dependency for Git-pinned consumption. Portable lifecycle cases
+run separately from dynamically linked Linux-only fault injection. The required
+gates include explicit doctests as well as all targets; current build commands
+are documented in [rust-interfaces.md](rust-interfaces.md#verification-gates).

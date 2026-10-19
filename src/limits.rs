@@ -1,21 +1,18 @@
+use crate::error::{CoreError, TaskErrorKind};
 use anyhow::{Context, Result, bail};
-use clap::Args;
+use serde::{Deserialize, Serialize};
 
 /// Limits apply to each host/harness operation, including OpenCode's inventory
 /// and exports together. Framing overhead has its own derived finite ceiling.
-#[derive(Args, Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Limits {
     /// Maximum bytes in one artifact (including OpenCode inventory)
-    #[arg(long, default_value_t = 256 * 1024 * 1024)]
     pub max_file_bytes: u64,
     /// Maximum artifacts, counting OpenCode inventory plus exports
-    #[arg(long, default_value_t = 100_000)]
     pub max_files: u64,
     /// Maximum combined payload bytes per host/harness
-    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
     pub max_total_bytes: u64,
     /// Timeout in seconds for the entire host/harness operation
-    #[arg(long, default_value_t = 300)]
     pub timeout_seconds: u64,
 }
 impl Default for Limits {
@@ -29,7 +26,7 @@ impl Default for Limits {
     }
 }
 impl Limits {
-    pub fn wire_limit(&self) -> Result<u64> {
+    pub(crate) fn wire_limit(&self) -> Result<u64> {
         if self.timeout_seconds == 0 {
             bail!("timeout must be at least one second");
         }
@@ -49,16 +46,19 @@ impl Budget {
         Self { files: 0, bytes: 0 }
     }
     pub fn add(&mut self, size: u64, limits: &Limits) -> Result<()> {
-        self.files = self.files.checked_add(1).context("file count overflow")?;
+        self.files = self
+            .files
+            .checked_add(1)
+            .context(CoreError::Task(TaskErrorKind::LimitExceeded))?;
         self.bytes = self
             .bytes
             .checked_add(size)
-            .context("archive total overflow")?;
+            .context(CoreError::Task(TaskErrorKind::LimitExceeded))?;
         if size > limits.max_file_bytes
             || self.files > limits.max_files
             || self.bytes > limits.max_total_bytes
         {
-            bail!("configured archive limit exceeded");
+            return Err(CoreError::Task(TaskErrorKind::LimitExceeded).into());
         }
         Ok(())
     }
@@ -66,10 +66,10 @@ impl Budget {
         if self
             .files
             .checked_add(count as u64)
-            .context("file count overflow")?
+            .context(CoreError::Task(TaskErrorKind::LimitExceeded))?
             > limits.max_files
         {
-            bail!("OpenCode inventory exceeds configured file count");
+            return Err(CoreError::Task(TaskErrorKind::LimitExceeded).into());
         }
         Ok(())
     }

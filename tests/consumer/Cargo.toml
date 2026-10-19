@@ -1,0 +1,16 @@
+[package]
+name = "glurp-library-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately independent: this crate proves the public dependency boundary.
+[workspace]
+
+[dependencies]
+glurp = { path = "../.." }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+serde_json = "1"
+tempfile = "3"
+fs2 = "0.4"
+libc = "0.2"

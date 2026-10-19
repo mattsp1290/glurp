@@ -1,7 +1,10 @@
 //! A host lock protects one durable transaction. Backups are complete and synced
 //! before ready.json becomes durable. Restart-visible committed journals are
 //! ambiguous: only the live publisher knows whether the commit sync succeeded.
+#[cfg(test)]
+use crate::archive::{TestCheckpoint, TestHooks};
 use crate::{
+    error::{CoreError, TaskErrorKind},
     remote::Deadline,
     secure::{self, Dir},
 };
@@ -238,6 +241,7 @@ fn recover_inner(base: &Dir, mode: Recovery) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(test))]
 pub fn publish(
     base: &Dir,
     txn: &Dir,
@@ -246,16 +250,30 @@ pub fn publish(
     paths: &[String],
     deadline: &Deadline,
 ) -> Result<()> {
-    publish_with(base, txn, artifacts, harness, paths, deadline, |_| Ok(()))
+    publish_inner(base, txn, artifacts, harness, paths, deadline)
 }
-fn publish_with(
+#[cfg(test)]
+pub(crate) fn publish_with_hooks(
     base: &Dir,
     txn: &Dir,
     artifacts: &Dir,
     harness: &str,
     paths: &[String],
     deadline: &Deadline,
-    mut checkpoint: impl FnMut(usize) -> Result<()>,
+    hooks: Option<&TestHooks>,
+) -> Result<()> {
+    publish_inner(base, txn, artifacts, harness, paths, deadline, |point| {
+        hooks.map_or(Ok(()), |hooks| hooks.hit(point))
+    })
+}
+fn publish_inner(
+    base: &Dir,
+    txn: &Dir,
+    artifacts: &Dir,
+    harness: &str,
+    paths: &[String],
+    deadline: &Deadline,
+    #[cfg(test)] mut checkpoint: impl FnMut(TestCheckpoint) -> Result<()>,
 ) -> Result<()> {
     let archive = base.child(harness, true)?;
     let backups = txn.child("backups", true)?;
@@ -307,7 +325,9 @@ fn publish_with(
     };
     txn.atomic_json_limited("ready.json", &journal, MAX_JOURNAL_BYTES)?;
     let result = (|| {
-        for (index, change) in changes.iter().enumerate() {
+        #[cfg(test)]
+        let mut published = 0;
+        for change in &changes {
             deadline.check()?;
             // Refuse a substituted nonregular target. A cooperating writer is
             // excluded by archive.lock; descriptors prevent directory redirection.
@@ -315,8 +335,14 @@ fn publish_with(
             unchanged(&target, &leaf, change)?;
             let (source, source_leaf) = artifacts.parent(&change.path, false)?;
             source.rename(&source_leaf, &target, &leaf)?;
-            checkpoint(index + 1)?;
+            #[cfg(test)]
+            {
+                published += 1;
+                checkpoint(TestCheckpoint::Publication(published))?;
+            }
         }
+        #[cfg(test)]
+        checkpoint(TestCheckpoint::BeforeCommit)?;
         deadline.check()?;
         // Move the complete durable journal; never unlink and reconstruct it.
         // Either name always retains every rollback instruction and backup.
@@ -338,13 +364,21 @@ fn publish_with(
         Ok(())
     })();
     if let Err(error) = result {
-        if recover_failed(base).is_err() {
-            bail!("publication failed and rollback needs recovery; private backups retained");
-        }
+        #[cfg(test)]
+        checkpoint(TestCheckpoint::BeforeRecovery)
+            .context(CoreError::Task(TaskErrorKind::RecoveryRequired))?;
+        recover_failed(base).context(CoreError::Task(TaskErrorKind::RecoveryRequired))?;
         return Err(error);
     }
     // Only this live publisher observed successful commit-directory sync.
     // Cleanup failure leaves ambiguity on restart, never cleanup authority.
+    #[cfg(test)]
+    if checkpoint(TestCheckpoint::Committed)
+        .and_then(|_| checkpoint(TestCheckpoint::BeforeCleanup))
+        .is_err()
+    {
+        return Ok(());
+    }
     let _ = base.remove_tree(".transaction");
     Ok(())
 }
@@ -354,6 +388,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use tokio_util::sync::CancellationToken;
     fn setup() -> (tempfile::TempDir, Dir, Dir, Dir) {
         let temp = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
@@ -401,15 +436,15 @@ mod tests {
             .write_all(b"new-c")
             .unwrap();
         let paths = vec!["a".into(), "c".into(), "b".into()];
-        let result = publish_with(
+        let result = publish_inner(
             &base,
             &txn,
             &artifacts,
             "codex",
             &paths,
-            &Deadline::new(10),
-            |index| {
-                if index == 2 {
+            &Deadline::new(10, CancellationToken::new()),
+            |point| {
+                if point == TestCheckpoint::Publication(2) {
                     // Force an actual ENOENT from the later rename, after both
                     // a replacement and a new artifact have already published.
                     artifacts.remove("b")?;
@@ -524,5 +559,175 @@ mod tests {
         recover(&base).unwrap();
         assert_eq!(read(&base, "a"), b"old-a");
         assert_eq!(read(&base, "b"), b"old-b");
+    }
+
+    #[test]
+    fn precommit_cancellation_restores_all_originals_and_mtimes() {
+        let (_temp, base, txn, artifacts) = setup();
+        let old = base
+            .child("codex", false)
+            .unwrap()
+            .read("a")
+            .unwrap()
+            .metadata()
+            .unwrap();
+        artifacts
+            .create_new("c")
+            .unwrap()
+            .write_all(b"new-c")
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let deadline = Deadline::new(30, cancellation.clone());
+        let result = publish_inner(
+            &base,
+            &txn,
+            &artifacts,
+            "codex",
+            &["a".into(), "c".into(), "b".into()],
+            &deadline,
+            |point| {
+                if point == TestCheckpoint::BeforeCommit {
+                    cancellation.cancel();
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(
+            crate::error::classify(&result.unwrap_err()),
+            CoreError::Cancelled
+        );
+        assert_eq!(read(&base, "a"), b"old-a");
+        assert_eq!(read(&base, "b"), b"old-b");
+        let archive = base.child("codex", false).unwrap();
+        assert!(archive.optional_file("c").unwrap().is_none());
+        let restored = archive.read("a").unwrap().metadata().unwrap();
+        assert_eq!(
+            (old.mtime(), old.mtime_nsec()),
+            (restored.mtime(), restored.mtime_nsec())
+        );
+        assert!(secure::not_found(
+            &base.child(".transaction", false).err().unwrap()
+        ));
+    }
+
+    #[test]
+    fn cancellation_after_durable_commit_keeps_the_committed_generation() {
+        let (_temp, base, txn, artifacts) = setup();
+        let cancellation = CancellationToken::new();
+        let deadline = Deadline::new(30, cancellation.clone());
+        publish_inner(
+            &base,
+            &txn,
+            &artifacts,
+            "codex",
+            &["a".into(), "b".into()],
+            &deadline,
+            |point| {
+                if point == TestCheckpoint::Committed {
+                    cancellation.cancel();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(cancellation.is_cancelled());
+        assert_eq!(read(&base, "a"), b"new-a");
+        assert_eq!(read(&base, "b"), b"new-b");
+        assert!(secure::not_found(
+            &base.child(".transaction", false).err().unwrap()
+        ));
+    }
+
+    #[test]
+    fn failed_rollback_outranks_cancellation_and_preserves_retryable_evidence() {
+        let (_temp, base, txn, artifacts) = setup();
+        let archive = base.child("codex", false).unwrap();
+        let cancellation = CancellationToken::new();
+        let deadline = Deadline::new(30, cancellation.clone());
+        let result = publish_inner(
+            &base,
+            &txn,
+            &artifacts,
+            "codex",
+            &["a".into(), "b".into()],
+            &deadline,
+            |point| {
+                if point == TestCheckpoint::BeforeCommit {
+                    cancellation.cancel();
+                    archive.rename("b", &archive, "blocked")?;
+                    archive.child("b", true)?;
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(
+            crate::error::classify(&result.unwrap_err()),
+            CoreError::Task(TaskErrorKind::RecoveryRequired)
+        );
+        assert!(txn.optional_file("ready.json").unwrap().is_some());
+        let backups = txn.child("backups", false).unwrap();
+        assert_eq!(backups.read("0").unwrap().metadata().unwrap().len(), 5);
+        assert_eq!(backups.read("1").unwrap().metadata().unwrap().len(), 5);
+        assert_eq!(read(&base, "a"), b"new-a");
+        assert!(recover_failed(&base).is_err());
+        archive.remove_tree("b").unwrap();
+        archive.rename("blocked", &archive, "b").unwrap();
+        // Restoration is deliberately allowed even while the task token remains cancelled.
+        recover_failed(&base).unwrap();
+        assert_eq!(read(&base, "a"), b"old-a");
+        assert_eq!(read(&base, "b"), b"old-b");
+    }
+
+    #[test]
+    fn partial_postcommit_cleanup_retains_success_and_refuses_ambiguous_recovery() {
+        let (_temp, base, txn, artifacts) = setup();
+        publish_inner(
+            &base,
+            &txn,
+            &artifacts,
+            "codex",
+            &["a".into(), "b".into()],
+            &Deadline::new(30, CancellationToken::new()),
+            |point| {
+                if point == TestCheckpoint::BeforeCleanup {
+                    txn.child("backups", false)?.remove("0")?;
+                    bail!("synthetic cleanup failure");
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(read(&base, "a"), b"new-a");
+        assert_eq!(read(&base, "b"), b"new-b");
+        let journal = txn.read("committed").unwrap().metadata().unwrap();
+        for _ in 0..2 {
+            assert!(recover(&base).is_err());
+            assert!(rollback(&base).is_err());
+            assert!(txn.optional_file(".rollback-required").unwrap().is_none());
+            assert!(
+                txn.child("backups", false)
+                    .unwrap()
+                    .optional_file("0")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                txn.child("backups", false)
+                    .unwrap()
+                    .read("1")
+                    .unwrap()
+                    .metadata()
+                    .unwrap()
+                    .len(),
+                5
+            );
+            let retained = txn.read("committed").unwrap().metadata().unwrap();
+            assert_eq!(
+                (journal.ino(), journal.mtime(), journal.mtime_nsec()),
+                (retained.ino(), retained.mtime(), retained.mtime_nsec())
+            );
+        }
+        assert_eq!(read(&base, "a"), b"new-a");
+        assert_eq!(read(&base, "b"), b"new-b");
     }
 }

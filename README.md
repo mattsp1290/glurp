@@ -1,6 +1,6 @@
 # Glurp
 
-`glurp` is a Linux/macOS CLI that privately collects AI coding-chat archives from remote machines over OpenSSH. It collects Claude Code, Codex, OpenCode, and pi histories without parsing or normalizing transcript content.
+`glurp` is a Linux/macOS CLI and Rust library that privately collects AI coding-chat archives from remote machines over OpenSSH. It collects Claude Code, Codex, OpenCode, and pi histories without parsing or normalizing transcript content.
 
 ## Install and upgrade
 
@@ -58,7 +58,9 @@ make build
 ./target/release/glurp --help
 # Install into Cargo's configured bin directory:
 make install
-# Run formatting, Clippy, all-target tests, release build, and installer tests:
+# Run formatting, Clippy, library/integration/example tests, doctests,
+# the locked consumer, release build, installer tests, and Git-consumer proof:
+# Commit the implementation first: Git-consumer proof tests that exact commit.
 make check
 ```
 
@@ -71,6 +73,132 @@ from Git; `VERSION=vX.Y.Z` overrides it. Direct Cargo builds accept
 manifest, and installer; see [releasing Glurp](docs/release.md).
 macOS remains a supported release target; its build and installation checks run
 in the release workflow rather than on every pull request or branch push.
+
+## Use as a Rust library
+
+The collection API runs in your process; it does not install or launch the
+`glurp` executable. Linux and macOS are supported. Local OpenSSH and the same
+remote POSIX utilities are still required, and OpenCode collection requires
+remote `opencode`. Host registration and explicit recovery remain CLI commands.
+There is no HTTP server, scheduler, or Agentcraft integration. Publishing to
+crates.io is deferred; use an exact Git revision.
+
+Pin the collection implementation to an exact revision:
+
+```toml
+[dependencies]
+glurp = { git = "https://github.com/mattsp1290/glurp.git", rev = "3f5e532aa270e5e9597a22882707686d2716e126" }
+tokio = { version = "1", features = ["rt", "macros", "signal"] }
+```
+
+Keep your application's `Cargo.lock` checked in. The async API requires an
+existing Tokio runtime and returns `CollectionError::MissingRuntime` when
+polled outside one. Configuration, SSH, validation, and filesystem work run in
+a blocking worker; the library does not create its own runtime.
+
+```rust,no_run
+use glurp::{
+    collect, CancellationToken, CollectionControl, CollectionRequest,
+    HostSpec, InputSource, Limits,
+};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cancellation = CancellationToken::new();
+    let request = CollectionRequest {
+        source: InputSource::Explicit {
+            hosts: vec![HostSpec {
+                name: "buildbox".into(),
+                destination: "buildbox".into(),
+                claude_paths: vec![],
+                codex_paths: vec![],
+                pi_paths: vec![],
+            }],
+            archive_root: "/absolute/private/archive".into(),
+        },
+        harnesses: vec![], // All four; use typed Harness values to select.
+        limits: Limits::default(),
+    };
+    let collection = collect(request, CollectionControl {
+        cancellation: cancellation.clone(),
+        progress: None,
+    });
+    tokio::pin!(collection);
+    let report = tokio::select! {
+        report = &mut collection => report?,
+        signal = tokio::signal::ctrl_c() => {
+            cancellation.cancel();
+            let report = collection.await?; // Wait for cleanup even on signal error.
+            signal?; // Signal policy belongs to this application.
+            report
+        }
+    };
+    // The application chooses how to handle or display the typed task results.
+    println!("{report:?}");
+    Ok(())
+}
+```
+
+For registered hosts, set `source` to
+`InputSource::Stored { config_dir, archive_root, hosts }`, with absolute
+`PathBuf` directories and a `Vec<String>` of aliases. Empty `hosts` selects all
+registered hosts. `config_dir` is a directory containing `config.json`, not a
+path to a custom configuration filename. Loading takes a short config snapshot
+lock and may create the private config directory and `config.lock`; it never
+changes host records and releases the lock before SSH. Explicit input does not
+open the registry or require `HOME`. Only the opt-in `default_paths()` helper
+reads `HOME`/XDG defaults and returns `CollectionPaths { config_dir, archive_root }`.
+Neither input mode writes environment variables.
+
+Each report has one deterministic result per selected host/harness. Statuses
+are `Collected { artifact_count, archive_dir }`, `NotFound`, `Busy`,
+`Failed { kind }`, `Cancelled`, and `NotStartedDueToCancellation`. Counts include
+unchanged artifacts collected in this task, exclude OpenCode inventory, and are
+not the cumulative archive size. `NotFound` does not promise an archive directory.
+Isolated failures and Busy hosts do not stop unrelated hosts. Only a report made
+entirely of `Collected`/`NotFound` results is successful; receiving `Ok(report)`
+does not by itself mean every task succeeded. Check `report.is_success()` or
+handle each entry in `report.tasks`. Invalid input/configuration and
+cancellation before a task plan exists return a request-level error.
+
+The host lease is keyed by `(archive_root, host alias)` and held across every
+selected harness and cleanup. A competing call or CLI process receives `Busy`
+when its worker attempts admission; calling `collect` does not reserve a host
+immediately. Different aliases or archive roots are independent archives, even
+when they address the same remote server. Destination binding still applies.
+There is no automatic retry or wait for a busy host.
+
+Each invocation derives a private child cancellation token. Cancelling a shared
+parent intentionally cancels all its children; independent tokens isolate calls.
+Dropping a polled future requests cancellation only for that invocation, while
+its worker continues cleanup and retains its lease. An unpolled future does no
+work. Cancel and await retained futures before shutting down the runtime: this
+is the cleanup boundary. A durably committed task stays `Collected`; recovery
+failure takes precedence over cancellation. Rollback and kernel-stalled filesystem
+operations have no hard wall-clock bound.
+
+Optional progress uses a bounded Tokio channel and nonblocking sends. A full or
+dropped receiver may lose every event without affecting collection; the final
+report is authoritative. Library calls install no signal handlers or panic hooks,
+print no ordinary output, and never exit the process. Returned errors are fixed,
+redacted categories. Unexpected panics still invoke the application's existing
+panic hook. See [the public API and internal interfaces](docs/rust-interfaces.md),
+[archive safety](docs/rust-safety.md), and [the complete example](examples/collect.rs).
+
+To verify the dependency boundary from a clean committed tree:
+
+```sh
+make git-consumer-test
+# After an authorized push, test the exact remote implementation commit:
+python3 -S distribution/tests/check_git_consumer.py \
+  --repository https://github.com/mattsp1290/glurp.git \
+  --revision 3f5e532aa270e5e9597a22882707686d2716e126
+```
+
+The verification script builds and runs a temporary standalone Git-pinned
+consumer without an installed Glurp executable. A path-dependent consumer alone
+does not establish remote consumability. Neither command publishes a package,
+creates a release tag, or dispatches a workflow.
 
 ## Configure hosts
 
@@ -192,5 +320,5 @@ This is a fresh Rust implementation. The only fixed legacy CLI requirement is
 schema, archive layout, and protocol are intentionally not compatible. There is no
 legacy command alias or automatic import of earlier Go Glurp or Slurp config and
 archives. Existing legacy state is not automatically read, migrated, or deleted.
-Historical `.agents/plans/` documents are retained as provenance. Current internal
+Historical `.agents/plans/` documents are retained as provenance. Current public and internal
 interfaces are documented in [rust-interfaces.md](docs/rust-interfaces.md).

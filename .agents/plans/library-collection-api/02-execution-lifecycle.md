@@ -1,0 +1,39 @@
+# WP2: Async execution, host leases and cancellation
+
+Prerequisite: WP1 contract scaffold. Existing safety behavior in `src/archive.rs`, `src/remote.rs`, `src/transaction.rs`, `src/collectors.rs` and `src/secure.rs` is the baseline; do not replace the transaction design.
+
+## Async worker
+
+Add Tokio runtime/sync support and tokio-util cancellation support in `Cargo.toml`/`Cargo.lock`, resolving versions compatible with pinned Rust. Add new private `src/cancellation.rs` under existing src. Proposed async collect uses one `spawn_blocking` worker for its complete finite batch, including all configuration, secure filesystem and process I/O. Do not perform blocking config/lock setup on an async executor thread. Do not spawn a nested runtime.
+
+Guard creation occurs before dispatch. A private per-call child token is captured by the worker and a cancel-on-drop guard by the future. Before spawning and at worker start, honor already-cancelled state without SSH/publication. If the future is never polled it performs no work. A caller cancellation requests a stop but the collect future keeps awaiting the worker. Only disarm the drop guard after worker completion. Do not return early from select-on-cancel and leave cleanup unobserved. A dropped future cancels its child token; an already running worker remains alive to clean up. JoinHandle abort alone is not cancellation of blocking work. Translate JoinError without exposing panic strings in returned errors. Unexpected Rust panics still invoke the caller's process-wide panic hook before JoinError is returned; catching a panic does not suppress this hook. Never replace the process hook. Silent execution/redaction applies to ordinary expected failures and returned worker errors, not arbitrary host/dependency panic-hook output. Library-owned panic messages must exclude sensitive data; avoid panicking on externally controlled inputs. Workers retain RAII owners for their resources. Document that catastrophic panic/abort may leave recoverable transaction evidence rather than a complete report.
+
+The caller owns runtime shutdown and request admission/scheduling. There is no new queue service or global runtime. A queued worker that starts after its call was dropped must check cancellation before side effects. Full shutdown must cancel and await retained collection futures. Runtime destruction alone is not a bounded cleanup API.
+
+## Per-invocation checks and CLI signals
+
+Replace `remote::CANCELLED` use in library paths. Proposed per-call cancellation state propagates through `remote::Deadline`, fetch, CheckedReader, archive staging, collector validation, and transaction publication. Each host/harness retains its existing per-task timeout and wire/size budget; no whole-batch timeout is added.
+
+Only CLI execution installs SIGINT/SIGTERM handling and translates signals into its collection token. Do not call token internals from an unsafe POSIX signal handler. Use an appropriate Tokio signal listener in CLI context, or an async-signal-safe flag plus a CLI bridge; select one and test shutdown/listener lifetime. Library imports and API calls install no handlers. Collection never reads the legacy global flag. A cancelled operation cannot poison subsequent calls.
+
+Preserve `remote::Process` RAII process-group kill/reap and bounded nonblocking pipe polling, including escaped descendants. Cancellation and deadline checks continue during validation and backup copying. Rollback is deliberately non-cancellable so restoration can finish. After publish reaches durable success, later cancellation cannot relabel that task Cancelled or roll it back; stop subsequent tasks instead. A cancellation racing failed publication must finish recover_failed or return RecoveryRequired while retaining evidence. Do not claim a hard time bound on kernel filesystem stalls or rollback.
+
+## Host-session ownership
+
+Refactor `archive::collect` into a proposed private HostSession admission plus per-harness collection routine. Keep the filesystem lock file as authority across processes and instances. Host identity is archive root plus alias, not destination string alone. Admission opens safe directories, attempts nonblocking exclusive lock, verifies binding and performs required recovery before contacting SSH. Retain the lock across every selected harness for that host and all cleanup. No await or user callback owns this lock outside the worker. Keep the locked directory anchor alive.
+
+Busy applies when another worker/process holds the lease at host-work admission. It yields Busy for each selected harness of that host, then continues unrelated hosts. It is not an immediate reservation at API creation and not an error for aliases with independent roots. Do not add waiting, retry or coalescing. Concurrent calls for different hosts may proceed. Existing CLI rollback must use the same authoritative lock. Releasing a cancelled future does not release the lock while its worker is cleaning up.
+
+Before every harness, including later harnesses under the same retained host lease, run the existing transaction readiness/recovery checks before creating staging or contacting SSH. A successful durable commit can still leave ambiguous evidence because transaction::publish intentionally ignores postcommit cleanup failure. Preserve that task as Collected. If evidence prevents safe continuation, preserve it unchanged and mark remaining host tasks Failed(RecoveryRequired), with no further SSH or staging reuse for that host. Continue unrelated hosts when not cancelled. Never infer a clean transaction directory solely from the preceding Collected status.
+
+If admission fails due to binding/recovery/storage, produce failed results for that host's tasks and continue independent hosts. If a task leaves RecoveryRequired evidence, do not start another harness for that host; report remaining host tasks as failed RecoveryRequired without SSH. Other ordinary isolated failures can continue. A cancellation stops admission of subsequent hosts.
+
+## Progress and error boundaries
+
+Optional proposed bounded Tokio mpsc sender; only try_send from the worker. Full receiver drops that event; disconnected receiver disables further sends or drops events. Neither blocks or fails collection. Final report always carries terminal task outcomes even if every event is lost. No arbitrary callbacks. Dropping the receiver never cancels a call.
+
+Replace user-visible string matching in main.rs::failure_reason with typed categories at known origin boundaries: lock acquisition, binding, deadline/cancellation, transport, stream limits/validation, filesystem and transaction recovery. Preserve deadline/cancellation provenance across remote::CheckedReader I/O conversion and the inventory and export serde_json decoding boundaries in src/collectors.rs. Those boundaries currently replace all decoding errors with generic JSON failures; carry a typed cause or explicit reader failure side-channel so a cancellation or timeout encountered inside a read cannot become malformed-JSON failure. Do not guess the cause solely from whether cancellation happens to be set after parsing fails. Internal anyhow may remain private, but public Display, Debug, serialization and Error::source must never expose its chain. Where exact classification is unavailable use Internal rather than unsafe text inspection. Preserve original safety semantics rather than changing transaction decisions to make classifications convenient.
+
+## Acceptance and exclusions
+
+WP3 must prove cancellation isolation, cancel-then-reuse, commit/cancel races, cleanup-before-awaited-return, lease retention on future drop, per-host Busy across harness boundaries, and progress saturation. Archive bytes, privacy permissions, rollback/evidence retention and pipe behavior remain intact. No async SSH rewrite, new archive schema, scheduler, detached perpetual service or forceful thread cancellation.
