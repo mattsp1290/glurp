@@ -1,5 +1,6 @@
 //! Descriptor-relative Unix storage. No operation follows a directory or file
 //! symlink, including when a pathname is replaced after an earlier check.
+use crate::error::{CoreError, TaskErrorKind};
 use anyhow::{Context, Result, bail};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
@@ -8,6 +9,27 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path};
+
+/// Own an exclusive flock lease independently of inherited/duplicated file
+/// descriptors. CLOEXEC closes inherited references only after a child execs;
+/// explicitly unlock when this owner finishes, including admission-error paths.
+pub(crate) struct ExclusiveLock(File);
+impl ExclusiveLock {
+    pub(crate) fn try_lock(file: File) -> io::Result<Self> {
+        fs2::FileExt::try_lock_exclusive(&file)?;
+        Ok(Self(file))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clone_file_for_test(&self) -> io::Result<File> {
+        self.0.try_clone()
+    }
+}
+impl Drop for ExclusiveLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
 
 pub struct Dir(File);
 
@@ -255,13 +277,19 @@ impl Dir {
             self.remove(".write.tmp")?;
         }
         let mut file = self.create_new(".write.tmp")?;
-        serde_json::to_writer(
-            &mut LimitedWriter {
-                file: &mut file,
-                remaining: max_bytes,
-            },
-            value,
-        )?;
+        let mut writer = LimitedWriter {
+            file: &mut file,
+            remaining: max_bytes,
+            limit_exceeded: false,
+        };
+        let serialization = serde_json::to_writer(&mut writer, value);
+        // serde_json may erase the original io::Error payload. This local
+        // side-channel identifies only the exact cap failure encountered while
+        // writing, rather than treating unrelated storage errors as limits.
+        if writer.limit_exceeded {
+            return Err(CoreError::Task(TaskErrorKind::LimitExceeded).into());
+        }
+        serialization?;
         file.sync_all()?;
         self.rename(".write.tmp", self, leaf)
     }
@@ -290,11 +318,15 @@ pub fn relative(path: &str) -> Result<()> {
 struct LimitedWriter<'a> {
     file: &'a mut File,
     remaining: u64,
+    limit_exceeded: bool,
 }
 impl std::io::Write for LimitedWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() as u64 > self.remaining {
-            return Err(io::Error::other("transaction metadata limit exceeded"));
+            self.limit_exceeded = true;
+            return Err(io::Error::other(CoreError::Task(
+                TaskErrorKind::LimitExceeded,
+            )));
         }
         let written = std::io::Write::write(self.file, bytes)?;
         self.remaining -= written as u64;
@@ -343,10 +375,28 @@ mod tests {
     fn oversized_journal_is_rejected_before_becoming_authoritative() {
         let storage = temp();
         let root = Dir::open(&storage.path().canonicalize().unwrap(), false).unwrap();
-        assert!(
-            root.atomic_json_limited("ready.json", &vec!["large metadata"; 10], 32)
-                .is_err()
+        let error = root
+            .atomic_json_limited("ready.json", &vec!["large metadata"; 10], 32)
+            .unwrap_err();
+        assert_eq!(
+            crate::error::classify(&error),
+            CoreError::Task(TaskErrorKind::LimitExceeded)
         );
         assert!(root.optional_file("ready.json").unwrap().is_none());
+    }
+
+    #[test]
+    fn journal_writer_does_not_misclassify_storage_failure_as_a_limit() {
+        let storage = temp();
+        let root = Dir::open(&storage.path().canonicalize().unwrap(), false).unwrap();
+        drop(root.create_new("read-only").unwrap());
+        let mut read_only = root.file("read-only", false).unwrap();
+        let mut writer = LimitedWriter {
+            file: &mut read_only,
+            remaining: 4096,
+            limit_exceeded: false,
+        };
+        assert!(serde_json::to_writer(&mut writer, &"synthetic private journal").is_err());
+        assert!(!writer.limit_exceeded);
     }
 }

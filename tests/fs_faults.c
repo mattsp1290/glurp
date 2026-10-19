@@ -5,11 +5,13 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 static int step;
+static atomic_int cleanup_paused;
 static int path_for(int fd, char *path, size_t size) {
     char link[64];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
@@ -124,5 +126,32 @@ int unlinkat(int fd, const char *name, int flags) {
         strcmp(name, "1") == 0 && path_for(fd, path, sizeof(path)) && strstr(path, "/.transaction/backups")) {
         record("partial-cleanup-failed\n"); errno = EIO; return -1;
     }
-    return real_unlinkat(fd, name, flags);
+    int result = real_unlinkat(fd, name, flags);
+    const char *host = getenv("GLURP_PAUSE_HOST_DIR");
+    if (result == 0 && mode && strcmp(mode, "pause-after-cleanup") == 0 &&
+        host && flags == AT_REMOVEDIR && strcmp(name, ".transaction") == 0 &&
+        path_for(fd, path, sizeof(path)) && strcmp(path, host) == 0 &&
+        atomic_exchange(&cleanup_paused, 1) == 0) {
+        // Pause only after the first transaction directory was fully removed.
+        // The production worker still owns its host lease and has not admitted
+        // the next harness. This is an external, test-only syscall seam.
+        const char *entered = getenv("GLURP_PAUSE_ENTERED");
+        const char *release = getenv("GLURP_PAUSE_RELEASE");
+        if (!entered || !release) { errno = EINVAL; return -1; }
+        int marker = open(entered, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (marker < 0) return -1;
+        close(marker);
+        record("cleanup-paused\n");
+        for (int attempt = 0; attempt < 20000; attempt++) {
+            if (access(release, F_OK) == 0) {
+                record("cleanup-released\n");
+                return result;
+            }
+            usleep(1000);
+        }
+        record("cleanup-barrier-timeout\n");
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    return result;
 }

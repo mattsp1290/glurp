@@ -1,6 +1,5 @@
-use crate::secure;
+use crate::{error::CollectionError, secure};
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -85,19 +84,47 @@ impl Host {
 
 pub struct Store {
     pub hosts: Vec<Host>,
+    _lock: secure::ExclusiveLock,
     dir: secure::Dir,
-    _lock: File,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_inner(path, None)
+    }
+
+    pub(crate) fn open_for_collection(
+        path: &Path,
+        token: &tokio_util::sync::CancellationToken,
+    ) -> Result<Self> {
+        Self::open_inner(path, Some(token))
+    }
+
+    fn open_inner(
+        path: &Path,
+        token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Self> {
+        if token.is_some_and(|token| token.is_cancelled()) {
+            return Err(CollectionError::CancelledBeforePlanning.into());
+        }
+        if path.file_name() != Some(std::ffi::OsStr::new("config.json")) {
+            bail!("configuration path must end in config.json");
+        }
         let dir = secure::Dir::open(path.parent().context("config parent missing")?, true)?;
         let lock = dir.file("config.lock", true)?;
-        lock.try_lock_exclusive()
-            .context("configuration is in use; retry later")?;
+        let lock = secure::ExclusiveLock::try_lock(lock).context(CollectionError::ConfigBusy)?;
         let hosts: Vec<Host> = match dir.file("config.json", false) {
             Ok(file) => {
-                serde_json::from_reader(file).context("invalid config.json; repair or remove it")?
+                let mut reader = ConfigReader {
+                    file,
+                    token,
+                    cancelled: false,
+                };
+                let parsed = serde_json::from_reader(std::io::BufReader::new(&mut reader));
+                if reader.cancelled {
+                    return Err(CollectionError::CancelledBeforePlanning.into());
+                }
+                parsed.context("invalid config.json; repair or remove it")?
             }
             Err(e)
                 if e.downcast_ref::<std::io::Error>()
@@ -165,5 +192,83 @@ impl Store {
         }
         selected.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(selected)
+    }
+}
+
+struct ConfigReader<'a> {
+    file: File,
+    token: Option<&'a tokio_util::sync::CancellationToken>,
+    cancelled: bool,
+}
+impl std::io::Read for ConfigReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if self.token.is_some_and(|token| token.is_cancelled()) {
+            self.cancelled = true;
+            return Err(std::io::Error::other(
+                CollectionError::CancelledBeforePlanning,
+            ));
+        }
+        std::io::Read::read(&mut self.file, bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn interrupted_config_read_retains_preplanning_cancellation() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"[]").unwrap();
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let token = CancellationToken::new();
+        let mut reader = ConfigReader {
+            file,
+            token: Some(&token),
+            cancelled: false,
+        };
+        let mut first = [0_u8; 1];
+        assert_eq!(reader.read(&mut first).unwrap(), 1);
+        assert_eq!(first, [b'[']);
+        token.cancel();
+        let error = reader.read(&mut first).unwrap_err();
+        assert!(reader.cancelled);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<CollectionError>()),
+            Some(&CollectionError::CancelledBeforePlanning)
+        );
+    }
+
+    #[test]
+    fn caller_supplied_config_filename_is_not_silently_ignored() {
+        let temp = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        assert!(Store::open(&temp.path().join("other.json")).is_err());
+        assert!(!temp.path().join("config.lock").exists());
+    }
+
+    #[test]
+    fn config_snapshot_owner_releases_inherited_description() {
+        let temp = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let path = temp.path().canonicalize().unwrap().join("config.json");
+        let store = Store::open(&path).unwrap();
+        let inherited = store._lock.clone_file_for_test().unwrap();
+        assert!(Store::open(&path).is_err());
+        drop(store);
+        // A concurrent process fork can retain this same open-file description
+        // until exec. It does not own the completed snapshot's lease.
+        assert!(Store::open(&path).is_ok());
+        drop(inherited);
     }
 }

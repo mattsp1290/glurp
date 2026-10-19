@@ -147,8 +147,10 @@ jobs:
         run: $EXEC "$BIN" --help
       # The full collector and filesystem fault-injection suite runs in CI.
       # LD_PRELOAD fault shims cannot interpose into the static musl binaries.
-      - name: Run unit and upgrade flow tests for the release target
-        run: cargo test --release --locked --target "$TARGET" --bin glurp --test upgrade
+      - name: Run library, binary unit, and upgrade tests for the release target
+        run: cargo test --release --locked --target "$TARGET" --lib --bin glurp --test upgrade
+      - name: Run portable library integration tests for the release target
+        run: cargo test --release --locked --target "$TARGET" --test library portable_
       - name: Smoke all four collectors with the release binary
         run: cargo test --release --locked --target "$TARGET" --test cli all_four_collectors_preserve_native_nested_bytes -- --exact
       # A dry run exercises platform sh, awk, mktemp and checksum tools before
